@@ -6,6 +6,7 @@
 //! against the live LeetCode API (see `tests/live_api.rs`).
 
 pub mod app;
+pub mod bg;
 pub mod config;
 pub mod leetcode;
 pub mod model;
