@@ -136,6 +136,44 @@ pub fn setup_snippet() -> &'static str {
     "require(\"leetr\").setup()"
 }
 
+/// Commands the bundled plugin registers, with a one-line description.
+///
+/// A test compares this list against the `nvim_create_user_command` calls in
+/// [`PLUGIN_SOURCE`] in both directions, so the CLI's install hint cannot drift
+/// from the plugin. It had: the hint still listed four commands long after the
+/// plugin grew to eight.
+pub const PLUGIN_COMMANDS: &[(&str, &str)] = &[
+    (
+        "LeetrStatus",
+        "show what Leetr has open, plus the last verdict",
+    ),
+    (
+        "LeetrOpen",
+        "ask Leetr to open a problem:  :LeetrOpen <slug>",
+    ),
+    ("LeetrPull", "load Leetr's buffer into this window"),
+    ("LeetrPush", "send this buffer to Leetr"),
+    ("LeetrRun", "run the sample tests"),
+    ("LeetrSubmit", "submit, then report the verdict"),
+    ("LeetrResult", "show the last judge verdict"),
+    (
+        "LeetrPort",
+        "point the plugin at another port:  :LeetrPort <n>",
+    ),
+];
+
+/// Install instructions, rendered from [`PLUGIN_COMMANDS`].
+pub fn install_hint() -> String {
+    let mut out = String::new();
+    out.push_str("Add this to your nvim config:\n");
+    out.push_str(&format!("  {}\n", setup_snippet()));
+    out.push_str("\nThen, in a Leetr workspace file:\n");
+    for (name, description) in PLUGIN_COMMANDS {
+        out.push_str(&format!("  :{name:<13} {description}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +354,40 @@ vim.cmd("q")"#;
                 "got {}",
                 path.display()
             );
+        }
+    }
+
+    /// The install hint must describe exactly the commands the plugin registers
+    /// — no more, no fewer. This is checked against the Lua itself, so adding a
+    /// command to the plugin without documenting it (or the reverse) fails.
+    #[test]
+    fn documented_commands_match_the_plugin_exactly() {
+        use std::collections::BTreeSet;
+
+        let marker = "nvim_create_user_command(\"";
+        let registered: BTreeSet<&str> = PLUGIN_SOURCE
+            .match_indices(marker)
+            .map(|(index, found)| {
+                let rest = &PLUGIN_SOURCE[index + found.len()..];
+                &rest[..rest.find('"').expect("unterminated command name")]
+            })
+            .collect();
+
+        let documented: BTreeSet<&str> = PLUGIN_COMMANDS.iter().map(|(name, _)| *name).collect();
+
+        assert_eq!(
+            registered, documented,
+            "the install hint and the plugin disagree about which commands exist"
+        );
+        assert!(!documented.is_empty());
+    }
+
+    #[test]
+    fn install_hint_lists_every_command_and_the_setup_line() {
+        let hint = install_hint();
+        assert!(hint.contains(setup_snippet()));
+        for (name, _) in PLUGIN_COMMANDS {
+            assert!(hint.contains(name), "hint is missing {name}");
         }
     }
 
