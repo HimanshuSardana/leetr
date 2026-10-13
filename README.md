@@ -40,7 +40,7 @@ Under active construction. Everything is developed in small, reviewable feature 
 | `Ctrl+P` / `Ctrl+K` command palettes | ✅ |
 | Workspace files + boilerplate + in-app editor | ✅ |
 | nvim interoperability | ✅ |
-| Run sample tests + submit | 🚧 |
+| Run sample tests + submit | ✅ |
 
 ## Requirements
 
@@ -114,11 +114,31 @@ Environment variables `LEETCODE_SESSION` and `LEETCODE_CSRFTOKEN` override the f
 
 > `credentials.toml` lives outside the repository and is never committed.
 
+## Running and submitting
+
+The **Code** tab has **Run tests** (sample cases) and **Submit**. Results appear in a panel
+under the editor: verdict, runtime, produced vs expected output, and compile/runtime errors.
+The same actions are available from nvim (`:LeetrRun`, `:LeetrSubmit`, `:LeetrResult`).
+
+Under the hood this uses LeetCode's judge protocol: `POST /problems/{slug}/submit/` (or
+`/interpret_solution/` for sample tests) returns an id, then
+`GET /submissions/detail/{id}/check/` is polled until a verdict is reported.
+
 ## Safety rail
 
 Submitting a solution to a problem that is **not already marked solved** on your account is
-refused by default. Flip `allow_unsolved_submit = true` in `config.toml` if you want to
-disable the guard.
+refused by default. The refusal happens *before* any request reaches LeetCode, so Leetr can
+never spend an attempt on an unsolved problem:
+
+```
+refusing to submit to `median-of-two-sorted-arrays`: it is not in your solved set.
+Leetr only submits to problems you have already solved —
+set `allow_unsolved_submit = true` in config.toml to override.
+```
+
+The Submit button is disabled for unsolved problems too. Flip
+`allow_unsolved_submit = true` in `config.toml` to disable the guard, and note that if the
+solved set has not loaded yet Leetr refuses rather than guessing.
 
 ## Editing: nvim interoperability
 
@@ -150,6 +170,10 @@ and by anything else you want to script:
 | `GET` | `/code` | the current buffer as text |
 | `POST` | `/code` | replace the current buffer |
 | `POST` | `/open` | open a problem by slug |
+| `POST` | `/run` | run the sample tests |
+| `POST` | `/submit` | submit the current buffer (respects the solved-guard) |
+
+`GET /state` also reports the latest judge result under `judge`.
 
 ```bash
 curl -s 127.0.0.1:9527/state
@@ -171,6 +195,9 @@ Then add `require("leetr").setup()` to your nvim config. Commands:
 | `:LeetrOpen <slug>` | ask Leetr to open a problem |
 | `:LeetrPull` | load Leetr's buffer into this window |
 | `:LeetrPush` | send this buffer to Leetr |
+| `:LeetrRun` | run the sample tests |
+| `:LeetrSubmit` | submit, then report the verdict |
+| `:LeetrResult` | show the last judge verdict |
 | `:LeetrPort <n>` | point the plugin at another port |
 
 Saving a file matching `*/solution.*` pushes it automatically, so the normal flow is just

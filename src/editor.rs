@@ -264,7 +264,9 @@ impl Buffer {
 
     /// Reload from disk when the file changed underneath us (e.g. `:w` in nvim).
     ///
-    /// Returns `true` when the buffer was reloaded.
+    /// Returns `true` only when the *contents* actually differ: an mtime bump
+    /// with identical text (which can happen when the app itself just wrote the
+    /// file) must not be reported as an external edit.
     pub fn reload_if_changed(&mut self) -> Result<bool> {
         let current = mtime(&self.path);
         if current.is_none() || current == self.last_mtime {
@@ -273,8 +275,13 @@ impl Buffer {
 
         let text = std::fs::read_to_string(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?;
-        self.text = text;
         self.last_mtime = current;
+
+        if text == self.text {
+            return Ok(false);
+        }
+
+        self.text = text;
         Ok(true)
     }
 
@@ -469,6 +476,29 @@ mod tests {
         assert!(buffer.reload_if_changed().unwrap());
         assert_eq!(buffer.text, "// edited in nvim\n");
         assert!(!buffer.reload_if_changed().unwrap(), "no further change");
+    }
+
+    #[test]
+    fn a_touched_but_identical_file_is_not_a_reload() {
+        let root = tmpdir("touch");
+        let ws = Workspace::new(root);
+        let prepared = ws.prepare(&detail(), "rust").unwrap();
+        let mut buffer = Buffer::load(prepared.solution.clone(), "two-sum", "1", "rust", "");
+
+        // Same bytes, newer mtime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let same = std::fs::read_to_string(&prepared.solution).unwrap();
+        std::fs::write(&prepared.solution, same).unwrap();
+
+        assert!(
+            !buffer.reload_if_changed().unwrap(),
+            "an mtime bump with identical contents must not report an external edit"
+        );
+
+        // Now genuinely different.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&prepared.solution, "// actually different\n").unwrap();
+        assert!(buffer.reload_if_changed().unwrap());
     }
 
     #[test]

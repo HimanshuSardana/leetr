@@ -14,12 +14,12 @@ use crate::glyphs;
 use crate::interop::{self, Command as InteropCommand, Shared as InteropShared, Snapshot};
 use crate::leetcode::client::ProblemQuery;
 use crate::leetcode::html::{self, Block};
-use crate::leetcode::LeetCodeClient;
+use crate::leetcode::{ensure_submittable, JudgeResult, LeetCodeClient, Verdict};
 use crate::model::{Problem, ProblemPage, QuestionDetail, UserStatus};
 use crate::nvim;
 use crate::theme::Theme;
 use crate::ui;
-use crate::ui::code_editor::{self, LanguageChoice};
+use crate::ui::code_editor::{self, JudgeView, LanguageChoice};
 use crate::ui::palette::{PaletteEntry, PaletteOutcome, PaletteState};
 use crate::ui::problem_list::{ProblemListAction, ProblemListState};
 use crate::ui::status_bar::AuthBadge;
@@ -33,6 +33,12 @@ enum ApiEvent {
     Problems {
         skip: u32,
         result: Job<ProblemPage>,
+    },
+    /// A finished judge run (sample tests or a submission).
+    Judge {
+        is_submission: bool,
+        slug: String,
+        result: Job<Box<JudgeResult>>,
     },
     Detail {
         slug: String,
@@ -176,6 +182,7 @@ pub struct LeetrApp {
     reloaded_from_disk: bool,
     /// Code pushed over the API before its problem finished loading.
     pending_code: Option<String>,
+    judge: Option<JudgeView>,
 
     interop_shared: Arc<InteropShared>,
     interop: Option<interop::RunningServer>,
@@ -265,6 +272,7 @@ impl LeetrApp {
             tab: Tab::Statement,
             reloaded_from_disk: false,
             pending_code: None,
+            judge: None,
             interop_shared,
             interop,
         };
@@ -431,6 +439,33 @@ impl LeetrApp {
                         }
                     }
                 }
+                ApiEvent::Judge {
+                    is_submission,
+                    slug,
+                    result,
+                } => match result {
+                    Ok(result) => {
+                        let view = JudgeView::from_result(&result, is_submission);
+                        self.status = view.summary.clone();
+                        if self.error.is_none() {
+                            self.error = None;
+                        }
+                        // A successful first submission means the problem is
+                        // now solved; keep the guard's data honest.
+                        if is_submission && result.verdict() == Verdict::Accepted {
+                            self.solved.insert(slug.clone());
+                        }
+                        self.judge = Some(view);
+                    }
+                    Err(err) => {
+                        self.status = "judge request failed".to_string();
+                        self.judge = Some(JudgeView {
+                            is_submission,
+                            error: Some(err),
+                            ..JudgeView::default()
+                        });
+                    }
+                },
                 ApiEvent::Session(result) => match result {
                     Ok((status, solved)) => {
                         self.status = format!(
@@ -546,6 +581,110 @@ impl LeetrApp {
         }
     }
 
+    /// Everything the judge needs about the current buffer.
+    fn judge_request(&self) -> Option<(String, String, String, String, String)> {
+        let detail = self.detail.as_ref()?;
+        let buffer = self.code.as_ref()?;
+        Some((
+            detail.slug.clone(),
+            detail.question_id.clone(),
+            buffer.lang_slug.clone(),
+            buffer.text.clone(),
+            detail.sample_test_case.clone(),
+        ))
+    }
+
+    fn start_judge(&mut self, is_submission: bool) {
+        if !self.client.is_authenticated() {
+            self.judge = Some(JudgeView {
+                is_submission,
+                error: Some(format!(
+                    "no credentials configured — add them to {}",
+                    config::credentials_path().display()
+                )),
+                ..JudgeView::default()
+            });
+            self.status = "not signed in".to_string();
+            return;
+        }
+
+        let Some((slug, question_id, lang_slug, code, sample_input)) = self.judge_request() else {
+            self.status = "open a problem first".to_string();
+            return;
+        };
+
+        if is_submission {
+            // Refuse to submit to a problem that is not already solved. This is
+            // the safety rail requested when the project was set up.
+            if self.solved.is_empty() {
+                self.judge = Some(JudgeView {
+                    is_submission,
+                    error: Some(
+                        "your solved set has not loaded yet, so Leetr refuses to submit \
+                         (it will never submit to an unsolved problem)"
+                            .to_string(),
+                    ),
+                    ..JudgeView::default()
+                });
+                self.status = "submission blocked".to_string();
+                return;
+            }
+            if let Err(err) =
+                ensure_submittable(&slug, &self.solved, self.config.allow_unsolved_submit)
+            {
+                self.judge = Some(JudgeView {
+                    is_submission,
+                    error: Some(err.to_string()),
+                    ..JudgeView::default()
+                });
+                self.status = "submission blocked".to_string();
+                return;
+            }
+        }
+
+        self.judge = Some(JudgeView {
+            is_submission,
+            running: true,
+            summary: if is_submission {
+                "Submitting…".to_string()
+            } else {
+                "Running sample tests…".to_string()
+            },
+            ..JudgeView::default()
+        });
+        self.status = self
+            .judge
+            .as_ref()
+            .map(|j| j.summary.clone())
+            .unwrap_or_default();
+
+        let client = self.client.clone();
+        self.bg.spawn(move || {
+            let outcome: Job<Box<JudgeResult>> = (|| {
+                let id = if is_submission {
+                    client
+                        .submit_solution(&slug, &question_id, &lang_slug, &code)
+                        .map(|id| id.to_string())
+                        .map_err(|err| err.to_string())?
+                } else {
+                    client
+                        .run_sample(&slug, &question_id, &lang_slug, &code, &sample_input)
+                        .map_err(|err| err.to_string())?
+                };
+                client
+                    .wait_for_submission(&id)
+                    .map(Box::new)
+                    .map_err(|err| err.to_string())
+            })();
+
+            ApiEvent::Judge {
+                is_submission,
+                slug,
+                result: outcome,
+            }
+        });
+    }
+
     fn open_in_nvim(&mut self) {
         let Some(buffer) = self.code.as_ref() else {
             self.status = "open a problem first".to_string();
@@ -572,6 +711,8 @@ impl LeetrApp {
         for command in self.interop_shared.take_commands() {
             match command {
                 InteropCommand::Open { slug } => self.open_problem(slug),
+                InteropCommand::Run => self.start_judge(false),
+                InteropCommand::Submit => self.start_judge(true),
                 InteropCommand::SetCode {
                     slug,
                     language,
@@ -642,6 +783,13 @@ impl LeetrApp {
             ready: self.code.is_some(),
             status: self.status.clone(),
             version: interop::API_VERSION.to_string(),
+            judge: self.judge.as_ref().map(|judge| interop::JudgeSummary {
+                is_submission: judge.is_submission,
+                running: judge.running,
+                verdict: judge.verdict.label().to_string(),
+                summary: judge.summary.clone(),
+                error: judge.error.clone(),
+            }),
         };
         self.interop_shared.publish(snapshot);
     }
@@ -662,6 +810,19 @@ impl LeetrApp {
                         egui::RichText::new(format!("{} unsaved", glyphs::DOT))
                             .color(crate::theme::WARNING)
                             .small(),
+                    );
+                }
+            }
+
+            if let Some(judge) = self.judge.as_ref().filter(|judge| !judge.running) {
+                if let Some(err) = judge.error.as_ref() {
+                    ui.label(egui::RichText::new(err).color(crate::theme::DANGER).small());
+                } else {
+                    ui.label(
+                        egui::RichText::new(judge.verdict.label())
+                            .color(code_editor::verdict_color(judge.verdict))
+                            .small()
+                            .strong(),
                     );
                 }
             }
@@ -697,8 +858,29 @@ impl LeetrApp {
 
         let dirty = buffer.is_dirty();
         let reloaded = self.reloaded_from_disk;
-        let action = code_editor::show(ui, buffer, &languages, dirty, reloaded);
+        let can_submit = self.config.allow_unsolved_submit
+            || self
+                .selected
+                .as_ref()
+                .is_some_and(|slug| self.solved.contains(slug));
+        let judge = self.judge.clone();
+        let action = code_editor::show(
+            ui,
+            buffer,
+            &languages,
+            dirty,
+            reloaded,
+            judge.as_ref(),
+            can_submit,
+        );
         self.reloaded_from_disk = false;
+
+        if action.run {
+            self.start_judge(false);
+        }
+        if action.submit {
+            self.start_judge(true);
+        }
 
         if let Some(language) = action.language {
             self.switch_language(language);

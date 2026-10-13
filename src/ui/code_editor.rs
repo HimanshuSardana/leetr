@@ -8,6 +8,7 @@ use egui::{RichText, TextEdit, Ui};
 
 use crate::editor::{self, Buffer};
 use crate::glyphs;
+use crate::leetcode::Verdict;
 use crate::theme;
 
 /// What the user asked the pane to do.
@@ -18,6 +19,82 @@ pub struct CodeEditorAction {
     pub changed: bool,
     /// The user asked for an explicit language switch.
     pub language: Option<String>,
+    /// Run the sample tests.
+    pub run: bool,
+    /// Submit the solution.
+    pub submit: bool,
+}
+
+/// The latest judge result, rendered under the editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeView {
+    /// True for a real submission, false for a sample run.
+    pub is_submission: bool,
+    pub running: bool,
+    pub verdict: Verdict,
+    pub summary: String,
+    pub error: Option<String>,
+    /// Extra rows: last test case, produced/expected output, compile errors…
+    pub detail: Vec<(String, String)>,
+}
+
+impl Default for JudgeView {
+    fn default() -> Self {
+        Self {
+            is_submission: false,
+            running: false,
+            verdict: Verdict::Pending,
+            summary: String::new(),
+            error: None,
+            detail: Vec::new(),
+        }
+    }
+}
+
+impl JudgeView {
+    /// Build a view from a finished judge result.
+    pub fn from_result(result: &crate::leetcode::JudgeResult, is_submission: bool) -> Self {
+        let mut detail = Vec::new();
+        if let Some(text) = result.error_text() {
+            detail.push(("Error".to_string(), text));
+        }
+        if let Some(case) = result
+            .last_testcase
+            .as_ref()
+            .filter(|t| !t.trim().is_empty())
+        {
+            detail.push(("Input".to_string(), case.clone()));
+        }
+        if let Some(output) = result.output_text() {
+            detail.push(("Output".to_string(), output));
+        }
+        if let Some(expected) = result.expected_text() {
+            detail.push(("Expected".to_string(), expected));
+        }
+        if let Some(memory) = result.memory_text() {
+            detail.push(("Memory".to_string(), memory));
+        }
+
+        Self {
+            is_submission,
+            running: false,
+            verdict: result.verdict(),
+            summary: result.summary(),
+            error: None,
+            detail,
+        }
+    }
+}
+
+/// Colour for a verdict.
+pub fn verdict_color(verdict: Verdict) -> egui::Color32 {
+    if verdict.is_accepted() {
+        theme::SUCCESS
+    } else if verdict == Verdict::Pending {
+        theme::WARNING
+    } else {
+        theme::DANGER
+    }
 }
 
 /// Languages offered in the picker (the problem's snippets).
@@ -34,6 +111,8 @@ pub fn show(
     languages: &[LanguageChoice],
     dirty: bool,
     reloaded_from_disk: bool,
+    judge: Option<&JudgeView>,
+    can_submit: bool,
 ) -> CodeEditorAction {
     let mut action = CodeEditorAction::default();
 
@@ -74,7 +153,32 @@ pub fn show(
                 );
             }
 
+            let running = judge.is_some_and(|view| view.running);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let submit = ui
+                    .add_enabled(!running, egui::Button::new("Submit"))
+                    .on_hover_text(if can_submit {
+                        "Submit this solution to LeetCode"
+                    } else {
+                        "Only problems you have already solved can be submitted"
+                    })
+                    .on_disabled_hover_text("Waiting for the judge…");
+                if submit.clicked() {
+                    action.submit = true;
+                }
+
+                if ui
+                    .add_enabled(!running, egui::Button::new("Run tests"))
+                    .on_hover_text("Run the sample test cases")
+                    .clicked()
+                {
+                    action.run = true;
+                }
+
+                if running {
+                    ui.spinner();
+                }
+
                 if ui
                     .button("Open in nvim")
                     .on_hover_text("Open this file in your editor; saving there updates Leetr")
@@ -111,6 +215,14 @@ pub fn show(
         ui.separator();
     });
 
+    if let Some(judge) = judge {
+        egui::Panel::bottom("leetr-judge")
+            .resizable(true)
+            .default_size(130.0)
+            .size_range(egui::Rangef::new(60.0, 400.0))
+            .show(ui, |ui| judge_panel(ui, judge));
+    }
+
     egui::CentralPanel::no_frame().show(ui, |ui| {
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -129,6 +241,57 @@ pub fn show(
     });
 
     action
+}
+
+fn judge_panel(ui: &mut Ui, judge: &JudgeView) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let what = if judge.is_submission {
+            "Submission"
+        } else {
+            "Sample tests"
+        };
+        ui.strong(what);
+
+        if judge.running {
+            ui.spinner();
+            ui.label(RichText::new("waiting for the judge…").weak());
+        } else if let Some(err) = judge.error.as_ref() {
+            ui.label(RichText::new(err).color(theme::DANGER));
+        } else {
+            ui.label(
+                RichText::new(judge.verdict.label())
+                    .color(verdict_color(judge.verdict))
+                    .strong(),
+            );
+            if !judge.summary.is_empty() && judge.summary != judge.verdict.label() {
+                ui.label(RichText::new(&judge.summary).weak().small());
+            }
+        }
+    });
+
+    if judge.detail.is_empty() {
+        ui.add_space(2.0);
+        return;
+    }
+
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (label, value) in &judge.detail {
+                ui.label(RichText::new(label).weak().small());
+                egui::Frame::default()
+                    .fill(ui.visuals().code_bg_color)
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(value).monospace().size(12.0));
+                    });
+                ui.add_space(4.0);
+            }
+        });
 }
 
 /// Build the language picker options from a problem's snippets.

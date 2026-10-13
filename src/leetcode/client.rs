@@ -111,6 +111,16 @@ impl LeetCodeClient {
         &self.base_url
     }
 
+    /// Exposed so the judge (run/submit) endpoints can reuse the same
+    /// connection pool and auth headers.
+    pub(crate) fn http(&self) -> &Client {
+        &self.http
+    }
+
+    pub(crate) fn credentials(&self) -> &Credentials {
+        &self.credentials
+    }
+
     /// Who, if anyone, the configured session belongs to.
     pub fn fetch_user_status(&self) -> Result<UserStatus> {
         let data: g::UserStatusData = self.graphql(g::Q_USER_STATUS, serde_json::json!({}))?;
