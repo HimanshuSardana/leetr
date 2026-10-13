@@ -78,6 +78,9 @@ pub struct JudgeSummary {
     pub verdict: String,
     pub summary: String,
     pub error: Option<String>,
+    /// Set when a submission proceeded with the solved-guard disabled.
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// Requests accepted from the nvim plugin.
@@ -595,6 +598,7 @@ mod tests {
                 verdict: "Accepted".into(),
                 summary: "Accepted · 40 ms".into(),
                 error: None,
+                warning: None,
             }),
             ..Snapshot::default()
         });

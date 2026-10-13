@@ -34,6 +34,8 @@ pub struct JudgeView {
     pub verdict: Verdict,
     pub summary: String,
     pub error: Option<String>,
+    /// Shown when the request proceeded despite the safety rail being off.
+    pub warning: Option<String>,
     /// Extra rows: last test case, produced/expected output, compile errors…
     pub detail: Vec<(String, String)>,
 }
@@ -46,6 +48,7 @@ impl Default for JudgeView {
             verdict: Verdict::Pending,
             summary: String::new(),
             error: None,
+            warning: None,
             detail: Vec::new(),
         }
     }
@@ -81,6 +84,7 @@ impl JudgeView {
             verdict: result.verdict(),
             summary: result.summary(),
             error: None,
+            warning: None,
             detail,
         }
     }
@@ -269,6 +273,15 @@ fn judge_panel(ui: &mut Ui, judge: &JudgeView) {
             }
         }
     });
+
+    if let Some(warning) = judge.warning.as_ref() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("{} {}", glyphs::DOT, warning))
+                .color(theme::WARNING)
+                .small(),
+        );
+    }
 
     if judge.detail.is_empty() {
         ui.add_space(2.0);

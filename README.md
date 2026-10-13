@@ -171,8 +171,12 @@ set `allow_unsolved_submit = true` in config.toml to override.
 ```
 
 The Submit button is disabled for unsolved problems too, and if the solved set has not
-loaded yet Leetr refuses rather than guessing. Set `allow_unsolved_submit = true` in
-`config.toml` to turn the guard off.
+loaded yet Leetr refuses rather than guessing.
+
+Setting `allow_unsolved_submit = true` in `config.toml` turns the guard off — and because
+that is exactly the kind of flag that is easy to leave switched on, doing so is **never
+silent**: every submission to an unsolved problem then carries a warning in the verdict
+panel, in the status bar and in `/state`, naming the problem and the config key.
 
 ## Architecture
 
