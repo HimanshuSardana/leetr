@@ -80,11 +80,24 @@ leetr whoami    # verifies the session and reports how many problems you've solv
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+P` | Problem selector |
-| `Ctrl+K` | Command palette |
-| `Up` / `Down`, `Tab` / `Shift+Tab` | Move the palette selection |
+| `Ctrl+P` | Problem selector — fuzzy-jump to any loaded problem |
+| `Ctrl+K` | Command palette — theme, reload, filters, links, quit |
+| `Tab` | Switch from the statement to the code pane |
+| `Ctrl+O` | Open the current solution in nvim |
+| `Ctrl+'` | Run the sample tests |
+| `Ctrl+Enter` | Submit the solution (respects the [safety rail](#safety-rail)) |
+| `Ctrl+B` | Show / hide the problem sidebar |
+
+While a palette is open it takes the keyboard instead:
+
+| Shortcut | Action |
+| --- | --- |
+| `Up` / `Down`, `Tab` / `Shift+Tab` | Move the selection |
 | `Enter` | Run the highlighted command / open the highlighted problem |
 | `Esc` | Close the palette |
+
+`Tab` switches panes on the main view but moves the selection inside a palette,
+so it never does both at once.
 
 ## CLI
 
