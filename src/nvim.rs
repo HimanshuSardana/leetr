@@ -199,6 +199,9 @@ mod tests {
             "LeetrPull",
             "LeetrPush",
             "LeetrPort",
+            "LeetrRun",
+            "LeetrSubmit",
+            "LeetrResult",
             "leetcode",
         ] {
             let expected = if command == "leetcode" {
@@ -211,6 +214,72 @@ mod tests {
                 "plugin should mention {expected}"
             );
         }
+    }
+
+    /// Actually load the plugin in neovim and check its commands exist.
+    ///
+    /// Skipped (not failed) when nvim is not installed, so CI images without it
+    /// still pass.
+    #[test]
+    fn plugin_loads_and_registers_commands_in_neovim() {
+        let Some(nvim) = find_nvim() else {
+            eprintln!("skipping: nvim is not on PATH");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!("leetr-nvim-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plugin = dir.join("leetr.lua");
+        std::fs::write(&plugin, PLUGIN_SOURCE).unwrap();
+
+        let script = r#"lua
+local ok, m = pcall(require, "leetr")
+if not ok then print("LOAD FAILED: " .. tostring(m)); vim.cmd("cq") end
+m.setup({ auto_push = false })
+local cmds = vim.api.nvim_get_commands({})
+local want = { "LeetrStatus", "LeetrOpen", "LeetrPull", "LeetrPush", "LeetrPort", "LeetrRun", "LeetrSubmit", "LeetrResult" }
+local missing = {}
+for _, c in ipairs(want) do
+  if not cmds[c] then table.insert(missing, c) end
+end
+if #missing > 0 then print("MISSING: " .. table.concat(missing, ",")); vim.cmd("cq") end
+print("PLUGIN_OK")
+vim.cmd("q")"#;
+
+        let output = Command::new(nvim)
+            .args(["--headless", "-u", "NONE"])
+            .arg("--cmd")
+            .arg(format!("set rtp+={}", dir.display()))
+            .arg("--cmd")
+            .arg(format!(
+                "lua package.path = '{}/?.lua;' .. package.path",
+                dir.display()
+            ))
+            .arg("-c")
+            .arg(script)
+            .output();
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let output = output.expect("running nvim");
+        // nvim's `print` goes to stderr in headless mode, so check both.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            output.status.success() && combined.contains("PLUGIN_OK"),
+            "nvim could not load the plugin.\nstatus: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status.code()
+        );
+    }
+
+    fn find_nvim() -> Option<&'static str> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("nvim"))
+            .find(|candidate| candidate.is_file())
+            .map(|_| "nvim")
     }
 
     #[test]

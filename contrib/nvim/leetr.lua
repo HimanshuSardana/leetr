@@ -8,6 +8,9 @@
 ---
 --- Commands:
 ---   :LeetrStatus        show what Leetr currently has open
+---   :LeetrRun           run the sample tests
+---   :LeetrSubmit        submit (Leetr refuses unless the problem is solved)
+---   :LeetrResult        show the last judge verdict
 ---   :LeetrOpen <slug>   ask Leetr to open a problem
 ---   :LeetrPull          load Leetr's current buffer into this window
 ---   :LeetrPush          send this buffer to Leetr
@@ -118,14 +121,17 @@ function M.status()
       notify("nothing open yet")
       return
     end
-    notify(
-      ("%s (%s) · %s · %s"):format(
-        state.title or state.slug,
-        state.slug,
-        state.language or "?",
-        state.solved and "solved" or "unsolved"
-      )
+    local message = ("%s (%s) · %s · %s"):format(
+      state.title or state.slug,
+      state.slug,
+      state.language or "?",
+      state.solved and "solved" or "unsolved"
     )
+    local verdict = verdict_text(state)
+    if verdict then
+      message = message .. "\n" .. verdict
+    end
+    notify(message)
   end)
 end
 
@@ -166,6 +172,82 @@ function M.pull()
   end)
 end
 
+--- Render a judge verdict from the app's state, if there is one.
+local function verdict_text(state)
+  local judge = state and state.judge
+  if not judge then
+    return nil
+  end
+  if judge.error then
+    return judge.error
+  end
+  local text = judge.verdict or "?"
+  if judge.summary and judge.summary ~= "" and judge.summary ~= judge.verdict then
+    text = text .. " — " .. judge.summary
+  end
+  return text
+end
+
+function M.run()
+  request("POST", "/run", nil, function(ok)
+    if ok then
+      notify("running sample tests…")
+      M.wait_for_verdict(0)
+    end
+  end)
+end
+
+function M.submit()
+  request("POST", "/submit", nil, function(ok)
+    if ok then
+      notify("submitting…")
+      M.wait_for_verdict(0)
+    end
+  end)
+end
+
+function M.result()
+  request("GET", "/state", nil, function(ok, body)
+    if not ok then
+      notify("could not reach Leetr", vim.log.levels.WARN)
+      return
+    end
+    local text = verdict_text(decode(body))
+    if not text then
+      notify("nothing has been run or submitted yet")
+      return
+    end
+    notify(text)
+  end)
+end
+
+--- Poll the app until the judge finishes, then report the verdict.
+function M.wait_for_verdict(attempts)
+  attempts = attempts or 0
+  if attempts > 60 then
+    notify("still judging — check :LeetrStatus", vim.log.levels.WARN)
+    return
+  end
+  vim.defer_fn(function()
+    request("GET", "/state", nil, function(ok, body)
+      if not ok then
+        return
+      end
+      local state = decode(body)
+      local judge = state and state.judge
+      if judge and not judge.running and judge.verdict then
+        local accepted = judge.verdict == "Accepted"
+        notify(
+          verdict_text(state),
+          accepted and vim.log.levels.INFO or vim.log.levels.WARN
+        )
+      else
+        M.wait_for_verdict(attempts + 1)
+      end
+    end)
+  end, 1000)
+end
+
 function M.push()
   local payload = current_payload(true)
   request("POST", "/code", encode(payload), function(ok)
@@ -198,6 +280,18 @@ function M.setup(options)
   vim.api.nvim_create_user_command("LeetrPush", function()
     M.push()
   end, { desc = "Send this buffer to Leetr" })
+
+  vim.api.nvim_create_user_command("LeetrRun", function()
+    M.run()
+  end, { desc = "Run the sample tests in Leetr" })
+
+  vim.api.nvim_create_user_command("LeetrSubmit", function()
+    M.submit()
+  end, { desc = "Submit the current buffer from Leetr" })
+
+  vim.api.nvim_create_user_command("LeetrResult", function()
+    M.result()
+  end, { desc = "Show the last judge verdict" })
 
   vim.api.nvim_create_user_command("LeetrPort", function(args)
     M.port = tonumber(args.args) or M.port
