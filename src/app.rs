@@ -1201,6 +1201,27 @@ impl eframe::App for LeetrApp {
             let open_problems = ui
                 .ctx()
                 .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
+            let open_nvim = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
+            let run_tests = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Quote));
+            let submit_solution = ui.ctx().input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers {
+                        command: true,
+                        ..Default::default()
+                    },
+                    egui::Key::Enter,
+                )
+            });
+            let tab_to_code = if self.tab == Tab::Statement {
+                ui.ctx()
+                    .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+            } else {
+                false
+            };
             let toggle_sidebar = ui
                 .ctx()
                 .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B));
@@ -1210,6 +1231,18 @@ impl eframe::App for LeetrApp {
             }
             if open_problems {
                 self.problems_palette.open();
+            }
+            if open_nvim {
+                self.open_in_nvim();
+            }
+            if run_tests && self.code.is_some() {
+                self.start_judge(false);
+            }
+            if submit_solution && self.code.is_some() {
+                self.start_judge(true);
+            }
+            if tab_to_code {
+                self.tab = Tab::Code;
             }
             if toggle_sidebar {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
