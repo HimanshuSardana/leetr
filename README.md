@@ -224,11 +224,15 @@ contrib/nvim/      the nvim plugin, embedded into the binary
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test                       # 170+ unit tests, offline
+cargo test                       # unit tests; offline, no network
 cargo test --test live_api -- --ignored   # hits the real LeetCode API
 ```
 
-CI runs fmt, clippy (denied warnings) and the test suite on every push and PR.
+CI runs on every push and PR:
+
+* `fmt`, `clippy -D warnings` and the offline test suite;
+* an **`msrv` job** that reads `rust-version` straight out of `Cargo.toml` and builds with
+  exactly that toolchain, so the declared minimum is verified rather than asserted.
 
 The live tests cover paging, search, statement fetching, the language list, the
 authenticated solved-set lookup, and headless rendering of the real statement and problem
