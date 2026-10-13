@@ -53,7 +53,7 @@ cd leetr
 cargo install --path .          # or: cargo build --release
 ```
 
-Requirements: Rust 1.82+, and on Linux the usual windowing headers
+Requirements: Rust 1.95+ (the `eframe`/`egui` 0.36 stack needs it), and on Linux the usual windowing headers
 (`libxkbcommon`, `libxcb`, `libx11`, `libwayland`, `libgl`). Optional: `nvim`, `tmux`.
 
 The first run writes default config to `~/.config/leetr/`.

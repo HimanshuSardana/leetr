@@ -46,3 +46,44 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+  msrv:
+    name: declared rust-version actually builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Derive the toolchain from Cargo.toml so this job verifies the claim
+      # instead of restating it. Before this existed the manifest declared
+      # 1.82 while the dependency graph required 1.95.
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "declared MSRV: $version"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Install GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libwayland-dev \
+            libgl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check with the declared MSRV
+        run: cargo check --all-targets
