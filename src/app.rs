@@ -180,6 +180,8 @@ pub struct LeetrApp {
     languages: Vec<LanguageChoice>,
     tab: Tab,
     reloaded_from_disk: bool,
+    sidebar_collapsed: bool,
+    sidebar_width: f32,
     /// Code pushed over the API before its problem finished loading.
     pending_code: Option<String>,
     judge: Option<JudgeView>,
@@ -270,6 +272,8 @@ impl LeetrApp {
             code: None,
             languages: Vec::new(),
             tab: Tab::Statement,
+            sidebar_collapsed: false,
+            sidebar_width: 420.0,
             reloaded_from_disk: false,
             pending_code: None,
             judge: None,
@@ -1197,12 +1201,18 @@ impl eframe::App for LeetrApp {
             let open_problems = ui
                 .ctx()
                 .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
+            let toggle_sidebar = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B));
 
             if open_actions {
                 self.actions_palette.open();
             }
             if open_problems {
                 self.problems_palette.open();
+            }
+            if toggle_sidebar {
+                self.sidebar_collapsed = !self.sidebar_collapsed;
             }
         }
 
@@ -1223,24 +1233,38 @@ impl eframe::App for LeetrApp {
             );
         });
 
+        let target_width = if self.sidebar_collapsed { 0.0 } else { 420.0 };
+        let dt = ui
+            .ctx()
+            .input(|i| i.predicted_dt)
+            .clamp(1.0 / 120.0, 1.0 / 30.0);
+        let speed = 12.0_f32;
+        self.sidebar_width += (target_width - self.sidebar_width) * (1.0 - (-speed * dt).exp());
+        if (target_width - self.sidebar_width).abs() < 0.5 {
+            self.sidebar_width = target_width;
+        }
+
         let mut action = ProblemListAction::default();
         let has_more = (self.problems.len() as u32) < self.total;
 
+        let sidebar_width = self.sidebar_width.max(0.0);
         egui::Panel::left("leetr-problems")
-            .resizable(true)
-            .default_size(420.0)
-            .size_range(egui::Rangef::new(280.0, 720.0))
+            .resizable(!self.sidebar_collapsed)
+            .exact_size(sidebar_width)
+            .size_range(egui::Rangef::new(0.0, 720.0))
             .show(ui, |ui| {
-                action = ui::problem_list::show(
-                    ui,
-                    &mut self.list_state,
-                    &self.problems,
-                    self.total,
-                    self.list_loading,
-                    self.list_error.as_deref(),
-                    has_more,
-                    self.selected.as_deref(),
-                );
+                if sidebar_width > 12.0 {
+                    action = ui::problem_list::show(
+                        ui,
+                        &mut self.list_state,
+                        &self.problems,
+                        self.total,
+                        self.list_loading,
+                        self.list_error.as_deref(),
+                        has_more,
+                        self.selected.as_deref(),
+                    );
+                }
             });
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
