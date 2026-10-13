@@ -8,6 +8,8 @@ use egui::style::Selection;
 use egui::{Color32, Stroke, Visuals};
 use serde::{Deserialize, Serialize};
 
+use crate::model::Difficulty;
+
 /// LeetCode's signature orange, used as the accent colour in both themes.
 pub const ACCENT: Color32 = Color32::from_rgb(0xff, 0xa1, 0x16);
 
@@ -19,6 +21,16 @@ pub const DANGER: Color32 = Color32::from_rgb(0xe5, 0x53, 0x4b);
 
 /// Yellow used for warnings.
 pub const WARNING: Color32 = Color32::from_rgb(0xd2, 0x99, 0x22);
+
+/// Colour used for a problem's difficulty badge.
+pub fn difficulty_color(difficulty: Difficulty) -> Color32 {
+    match difficulty {
+        Difficulty::Easy => Color32::from_rgb(0x2c, 0xbb, 0x8a),
+        Difficulty::Medium => Color32::from_rgb(0xe8, 0xb3, 0x39),
+        Difficulty::Hard => Color32::from_rgb(0xef, 0x4a, 0x4a),
+        Difficulty::Unknown => Color32::from_rgb(0x8a, 0x8f, 0x98),
+    }
+}
 
 /// A concrete colour scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -43,8 +55,8 @@ impl Theme {
     /// Small glyph shown on the theme toggle.
     pub fn icon(self) -> &'static str {
         match self {
-            Self::Dark => "\u{1F319}", // 🌙
-            Self::Light => "\u{2600}", // ☀
+            Self::Dark => crate::glyphs::MOON,
+            Self::Light => crate::glyphs::SUN,
         }
     }
 
@@ -219,6 +231,21 @@ mod tests {
             light.widgets.noninteractive.fg_stroke.color,
             light.panel_fill
         );
+    }
+
+    #[test]
+    fn difficulty_colours_are_distinct() {
+        let colours = [
+            difficulty_color(Difficulty::Easy),
+            difficulty_color(Difficulty::Medium),
+            difficulty_color(Difficulty::Hard),
+            difficulty_color(Difficulty::Unknown),
+        ];
+        for (i, a) in colours.iter().enumerate() {
+            for b in colours.iter().skip(i + 1) {
+                assert_ne!(a, b, "difficulty colours must be distinguishable");
+            }
+        }
     }
 
     #[test]

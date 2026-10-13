@@ -71,12 +71,16 @@ impl ProblemStatus {
         }
     }
 
-    /// Single-character marker used in compact listings.
+    /// Compact marker used in the problem list.
+    ///
+    /// These glyphs are deliberately chosen from what egui's *default* fonts
+    /// actually contain. `✓` (U+2713) and friends are not present and render
+    /// as tofu boxes — see `ui::glyph_tests`.
     pub fn marker(self) -> &'static str {
         match self {
-            Self::Solved => "✓",
-            Self::Attempted => "~",
-            Self::Todo => " ",
+            Self::Solved => crate::glyphs::SOLVED,
+            Self::Attempted => crate::glyphs::ATTEMPTED,
+            Self::Todo => crate::glyphs::TODO,
         }
     }
 
@@ -212,6 +216,28 @@ mod tests {
         );
         assert_eq!(ProblemStatus::from_wire(None), ProblemStatus::Todo);
         assert_eq!(ProblemStatus::from_wire(Some("weird")), ProblemStatus::Todo);
+    }
+
+    #[test]
+    fn problem_status_markers_are_single_visible_glyphs() {
+        for status in [
+            ProblemStatus::Solved,
+            ProblemStatus::Attempted,
+            ProblemStatus::Todo,
+        ] {
+            let marker = status.marker();
+            assert!(!marker.is_empty(), "{status:?} needs a marker");
+            assert!(
+                marker.chars().all(|c| !c.is_ascii_whitespace()),
+                "{status:?} marker must be visible"
+            );
+        }
+        // Distinct so the list is readable at a glance.
+        assert_ne!(ProblemStatus::Solved.marker(), ProblemStatus::Todo.marker());
+        assert_ne!(
+            ProblemStatus::Attempted.marker(),
+            ProblemStatus::Todo.marker()
+        );
     }
 
     #[test]
