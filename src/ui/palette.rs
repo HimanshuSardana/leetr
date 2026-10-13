@@ -4,8 +4,7 @@
 //! The matching logic is a pure function so it can be tested exhaustively
 //! without an egui context.
 
-use egui::text::LayoutJob;
-use egui::{Color32, FontId, Key, RichText, TextEdit, TextFormat, Ui};
+use egui::{Color32, Key, RichText, TextEdit};
 
 /// Width of the palette popup.
 const PALETTE_WIDTH: f32 = 680.0;
@@ -13,6 +12,8 @@ const PALETTE_WIDTH: f32 = 680.0;
 const LIST_HEIGHT: f32 = 400.0;
 /// Upper bound on rendered rows, so a 4000-entry list stays instant.
 const MAX_ROWS: usize = 200;
+/// Height of one result row.
+const ROW_HEIGHT: f32 = 40.0;
 
 // ---------------------------------------------------------------------------
 // Fuzzy matching
@@ -246,17 +247,17 @@ pub fn show(
         state.scroll_to_selection = true;
     }
 
-    // Build on `Modal::default_area` rather than a bare `Area`: it carries
-    // `UiKind::Modal` and `Order::Foreground`, without which the modal is not
-    // drawn above the panels.
-    let popup_frame = egui::Frame::popup(&egui::Style::default())
-        .corner_radius(egui::CornerRadius::same(12))
-        .inner_margin(egui::Margin::same(14))
+    // A rounded, shadowed card with a borderless search field and an
+    // accent-tinted selection reads as a modern launcher rather than a stock
+    // egui popup.
+    let popup_frame = egui::Frame::popup(ctx.global_style().as_ref())
+        .corner_radius(egui::CornerRadius::same(14))
+        .inner_margin(egui::Margin::ZERO)
         .shadow(egui::epaint::Shadow {
-            offset: [0, 8],
-            blur: 24,
+            offset: [0, 12],
+            blur: 32,
             spread: 0,
-            color: Color32::from_black_alpha(90),
+            color: Color32::from_black_alpha(110),
         });
 
     let response = egui::Modal::new(modal_id)
@@ -268,50 +269,166 @@ pub fn show(
             let mut empty_action_clicked = false;
             ui.set_width(PALETTE_WIDTH);
 
-            ui.horizontal(|ui| {
-                let edit = ui.add(
-                    TextEdit::singleline(&mut state.query)
-                        .id(modal_id.with("query"))
-                        .hint_text(placeholder)
-                        .desired_width(f32::INFINITY),
-                );
-                if std::mem::take(&mut state.grab_focus) {
-                    edit.request_focus();
-                }
-                if edit.changed() {
-                    state.selected = 0;
-                }
-            });
+            let dark = ui.visuals().dark_mode;
+            let border = if dark {
+                Color32::from_rgb(0x2a, 0x2f, 0x37)
+            } else {
+                Color32::from_rgb(0xe6, 0xe8, 0xec)
+            };
+            let selection_fill = if dark {
+                Color32::from_rgb(0x2a, 0x35, 0x49)
+            } else {
+                Color32::from_rgb(0xe9, 0xef, 0xf9)
+            };
+            let hover_fill = if dark {
+                Color32::from_rgb(0x20, 0x25, 0x2c)
+            } else {
+                Color32::from_rgb(0xf2, 0xf4, 0xf7)
+            };
 
-            ui.add_space(6.0);
-            ui.separator();
+            // -- search -------------------------------------------------
+            let search = egui::Frame::NONE
+                .inner_margin(egui::Margin::symmetric(16, 14))
+                .show(ui, |ui| {
+                    let edit = ui.add(
+                        TextEdit::singleline(&mut state.query)
+                            .id(modal_id.with("query"))
+                            .hint_text(RichText::new(placeholder).size(15.0))
+                            .frame(egui::Frame::NONE)
+                            .font(egui::FontId::proportional(15.0))
+                            .desired_width(f32::INFINITY),
+                    );
+                    if std::mem::take(&mut state.grab_focus) {
+                        edit.request_focus();
+                    }
+                    if edit.changed() {
+                        state.selected = 0;
+                    }
+                });
+            ui.painter().hline(
+                search.response.rect.x_range(),
+                search.response.rect.bottom(),
+                egui::Stroke::new(1.0, border),
+            );
 
+            // -- results ------------------------------------------------
             egui::ScrollArea::vertical()
                 .max_height(LIST_HEIGHT)
-                .auto_shrink([false, true])
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    ui.add_space(6.0);
+
                     if matches.is_empty() {
-                        ui.add_space(8.0);
-                        match empty_action {
+                        ui.add_space(12.0);
+                        ui.vertical_centered(|ui| match empty_action {
                             Some(label) => {
-                                if ui.button(label).clicked() {
+                                if ui
+                                    .add(egui::Button::new(label).corner_radius(8.0))
+                                    .clicked()
+                                {
                                     empty_action_clicked = true;
                                 }
                             }
                             None => {
                                 ui.label(RichText::new("No matches").weak());
                             }
-                        }
-                        ui.add_space(8.0);
+                        });
+                        ui.add_space(12.0);
                         return;
                     }
 
                     for (row, &entry_index) in matches.iter().enumerate().take(MAX_ROWS) {
                         let entry = &entries[entry_index];
                         let is_selected = row == state.selected;
-                        let job = row_job(entry, ui, is_selected);
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), ROW_HEIGHT),
+                            egui::Sense::click(),
+                        );
 
-                        let response = ui.selectable_label(is_selected, job);
+                        if ui.is_rect_visible(rect) {
+                            let pill = rect.shrink2(egui::vec2(6.0, 2.0));
+                            if is_selected {
+                                ui.painter().rect_filled(
+                                    pill,
+                                    egui::CornerRadius::same(8),
+                                    selection_fill,
+                                );
+                            } else if response.hovered() {
+                                ui.painter().rect_filled(
+                                    pill,
+                                    egui::CornerRadius::same(8),
+                                    hover_fill,
+                                );
+                            }
+
+                            let text_color = if is_selected {
+                                ui.visuals().strong_text_color()
+                            } else {
+                                ui.visuals().text_color()
+                            };
+                            let hint_color = ui.visuals().weak_text_color();
+                            let inner = rect.shrink2(egui::vec2(16.0, 0.0));
+
+                            let hint_font = egui::FontId::proportional(12.0);
+                            let hint_width = if entry.hint.is_empty() {
+                                0.0
+                            } else {
+                                ui.painter()
+                                    .layout_no_wrap(
+                                        entry.hint.clone(),
+                                        hint_font.clone(),
+                                        hint_color,
+                                    )
+                                    .size()
+                                    .x
+                                    + 16.0
+                            };
+
+                            // The entry's icon carries real information — for
+                            // Ctrl+P it is the solved / attempted / todo marker.
+                            // NOTE: this must stay. An earlier rewrite of this
+                            // row dropped it and silently removed those markers;
+                            // no test caught it because nothing asserted painted
+                            // output, only that rendering did not panic.
+                            let mut label_left = inner.left();
+                            if let Some(icon) = entry.icon.as_deref() {
+                                let galley = ui.painter().layout_no_wrap(
+                                    icon.to_owned(),
+                                    egui::FontId::monospace(14.0),
+                                    text_color,
+                                );
+                                let position = egui::pos2(
+                                    inner.left(),
+                                    inner.center().y - galley.size().y / 2.0,
+                                );
+                                label_left += galley.size().x + 8.0;
+                                ui.painter().galley(position, galley, text_color);
+                            }
+
+                            let label = ui.painter().layout(
+                                entry.label.clone(),
+                                egui::FontId::proportional(14.5),
+                                text_color,
+                                (inner.width() - hint_width - (label_left - inner.left()))
+                                    .max(40.0),
+                            );
+                            ui.painter().galley(
+                                egui::pos2(label_left, inner.center().y - label.size().y / 2.0),
+                                label,
+                                text_color,
+                            );
+
+                            if !entry.hint.is_empty() {
+                                ui.painter().text(
+                                    egui::pos2(inner.right(), inner.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    &entry.hint,
+                                    hint_font,
+                                    hint_color,
+                                );
+                            }
+                        }
+
                         if is_selected && state.scroll_to_selection {
                             response.scroll_to_me(Some(egui::Align::Center));
                         }
@@ -319,6 +436,8 @@ pub fn show(
                             outcome.chosen = Some(entry_index);
                         }
                     }
+
+                    ui.add_space(6.0);
                 });
 
             state.scroll_to_selection = false;
@@ -332,23 +451,29 @@ pub fn show(
                 outcome.empty_action = true;
             }
 
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                // Deliberately plain text: arrow and return glyphs are absent
-                // from egui's default fonts (see `crate::glyphs`).
-                ui.label(
-                    RichText::new("Up/Down navigate · Enter select · Esc close")
-                        .weak()
-                        .small(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{} of {}", matches.len(), entries.len()))
+            // -- footer ------------------------------------------------
+            let footer = egui::Frame::NONE
+                .inner_margin(egui::Margin::symmetric(16, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let hint = RichText::new("Up/Down navigate · Enter select · Esc close")
                             .weak()
-                            .small(),
-                    );
+                            .small();
+                        ui.label(hint);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{} of {}", matches.len(), entries.len()))
+                                    .weak()
+                                    .small(),
+                            );
+                        });
+                    });
                 });
-            });
+            ui.painter().hline(
+                footer.response.rect.x_range(),
+                footer.response.rect.top(),
+                egui::Stroke::new(1.0, border),
+            );
 
             outcome
         });
@@ -362,63 +487,6 @@ pub fn show(
         state.close();
     }
     outcome
-}
-
-fn row_job(entry: &PaletteEntry, ui: &Ui, is_selected: bool) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = ui.available_width().max(200.0);
-
-    let text_color = if is_selected {
-        ui.visuals().strong_text_color()
-    } else {
-        ui.visuals().text_color()
-    };
-    let hint_color = ui.visuals().weak_text_color();
-
-    if let Some(icon) = &entry.icon {
-        job.append(
-            icon,
-            0.0,
-            TextFormat {
-                font_id: FontId::monospace(14.0),
-                color: text_color,
-                ..Default::default()
-            },
-        );
-        job.append(
-            " ",
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(14.0),
-                color: text_color,
-                ..Default::default()
-            },
-        );
-    }
-
-    job.append(
-        &entry.label,
-        0.0,
-        TextFormat {
-            font_id: FontId::proportional(14.0),
-            color: text_color,
-            ..Default::default()
-        },
-    );
-
-    if !entry.hint.is_empty() {
-        job.append(
-            &format!("  {}", entry.hint),
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(12.0),
-                color: hint_color,
-                ..Default::default()
-            },
-        );
-    }
-
-    job
 }
 
 #[cfg(test)]
