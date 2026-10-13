@@ -37,7 +37,7 @@ Under active construction. Everything is developed in small, reviewable feature 
 | Dark mode | ✅ |
 | LeetCode API client + CLI | ✅ |
 | Problem list + statement viewer | 🚧 |
-| `Ctrl+P` / `Ctrl+K` command palettes | 🚧 |
+| `Ctrl+P` / `Ctrl+K` command palettes | ✅ |
 | Workspace files + boilerplate + in-app editor | 🚧 |
 | nvim interoperability | 🚧 |
 | Run sample tests + submit | 🚧 |
@@ -81,6 +81,23 @@ leetr whoami                          # verify the configured session
 `leetr show` renders LeetCode's HTML statement into readable terminal text
 (decoded entities, `10^4` superscripts, monospaced examples, bulleted
 constraints) — the same renderer the GUI uses.
+
+## Keybindings
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+P` | Problem selector — fuzzy-jump to any loaded problem |
+| `Ctrl+K` | Command palette — theme, reload, filters, links, quit |
+| `Up` / `Down`, `Tab` / `Shift+Tab` | Move the palette selection |
+| `Enter` | Run the highlighted command / open the highlighted problem |
+| `Esc` | Close the palette |
+
+Both palettes fuzzy-match on the label *and* the hint, so `theme`, `reload`,
+`filters` or `quit` all find the right command. They rank word-boundary and
+contiguous matches highest, which is why `sum` puts **Two Sum** first.
+
+If `Ctrl+P` finds nothing locally, an inline **"Search LeetCode for …"** action
+falls back to a server-side search — no per-keystroke network requests.
 
 ## Credentials
 

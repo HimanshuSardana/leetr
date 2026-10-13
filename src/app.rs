@@ -7,12 +7,14 @@ use eframe::egui;
 
 use crate::bg::Bg;
 use crate::config::{self, Config, Credentials};
+use crate::glyphs;
 use crate::leetcode::client::ProblemQuery;
 use crate::leetcode::html::{self, Block};
 use crate::leetcode::LeetCodeClient;
 use crate::model::{Problem, ProblemPage, QuestionDetail, UserStatus};
 use crate::theme::Theme;
 use crate::ui;
+use crate::ui::palette::{PaletteEntry, PaletteOutcome, PaletteState};
 use crate::ui::problem_list::{ProblemListAction, ProblemListState};
 use crate::ui::status_bar::AuthBadge;
 
@@ -31,6 +33,99 @@ enum ApiEvent {
         result: Job<Box<QuestionDetail>>,
     },
     Session(Job<(UserStatus, BTreeSet<String>)>),
+}
+
+/// Cap on how many loaded problems the `Ctrl+P` palette will offer.
+const MAX_PALETTE_PROBLEMS: usize = 1500;
+
+/// Things the `Ctrl+K` palette can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    ToggleTheme,
+    SelectProblem,
+    RefreshProblems,
+    LoadMore,
+    ClearFilters,
+    TogglePremiumFilter,
+    OpenOnLeetCode,
+    CopyProblemLink,
+    Quit,
+}
+
+impl Action {
+    /// Stable, state-independent label used by the `Ctrl+K` palette.
+    ///
+    /// Kept as a method (rather than inline strings) so a test can assert that
+    /// the labels users are likely to type actually match.
+    fn search_label(self) -> &'static str {
+        match self {
+            Self::ToggleTheme => "Toggle theme",
+            Self::SelectProblem => "Go to problem",
+            Self::RefreshProblems => "Reload problem list",
+            Self::LoadMore => "Load more problems",
+            Self::ClearFilters => "Clear problem filters",
+            Self::TogglePremiumFilter => "Toggle premium-only problems",
+            Self::OpenOnLeetCode => "Open on leetcode.com",
+            Self::CopyProblemLink => "Copy problem link",
+            Self::Quit => "Quit Leetr",
+        }
+    }
+}
+
+/// Every action the palette can offer, in display order.
+///
+/// Test-only: `action_catalog` filters this by applicability at runtime.
+#[cfg(test)]
+const ALL_ACTIONS: &[Action] = &[
+    Action::ToggleTheme,
+    Action::SelectProblem,
+    Action::RefreshProblems,
+    Action::LoadMore,
+    Action::ClearFilters,
+    Action::TogglePremiumFilter,
+    Action::OpenOnLeetCode,
+    Action::CopyProblemLink,
+    Action::Quit,
+];
+
+/// Reduce a palette outcome to a chosen row index.
+///
+/// Choosing a row (or dismissing the palette) always closes it, so the palette
+/// never lingers after the user has acted.
+fn resolve_palette_choice(state: &mut PaletteState, outcome: &PaletteOutcome) -> Option<usize> {
+    if outcome.chosen.is_some() || outcome.closed {
+        state.close();
+    }
+    outcome.chosen
+}
+
+/// Canonical URL for a problem.
+fn problem_url(slug: &str) -> String {
+    format!("https://leetcode.com/problems/{slug}/")
+}
+
+/// Hand a URL to the platform opener. Best effort — failures are surfaced in
+/// the status bar rather than aborting.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let candidates: &[&str] = &["open"];
+    #[cfg(target_os = "windows")]
+    let candidates: &[&str] = &["explorer"];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: &[&str] = &["xdg-open", "gio", "sensible-browser"];
+
+    for command in candidates {
+        let mut process = std::process::Command::new(command);
+        if *command == "gio" {
+            process.arg("open");
+        }
+        match process.arg(url).spawn() {
+            Ok(_) => return Ok(()),
+            Err(_) => continue,
+        }
+    }
+
+    Err(format!("could not find a browser opener for {url}"))
 }
 
 pub struct LeetrApp {
@@ -56,6 +151,9 @@ pub struct LeetrApp {
 
     user: Option<UserStatus>,
     solved: BTreeSet<String>,
+
+    actions_palette: PaletteState,
+    problems_palette: PaletteState,
 }
 
 impl LeetrApp {
@@ -103,6 +201,8 @@ impl LeetrApp {
             detail_error: None,
             user: None,
             solved: BTreeSet::new(),
+            actions_palette: PaletteState::default(),
+            problems_palette: PaletteState::default(),
         };
 
         app.refresh_session();
@@ -289,6 +389,205 @@ impl LeetrApp {
         }
     }
 
+    // -- command palettes ---------------------------------------------------
+
+    /// Every action reachable from `Ctrl+K`, in display order.
+    ///
+    /// Labels are the verb ("Toggle theme") and hints are the detail the user
+    /// might remember instead ("switch to Light mode"), because both are
+    /// searched by the fuzzy matcher.
+    fn action_catalog(&self) -> Vec<(Action, PaletteEntry)> {
+        let theme = self.config.theme;
+        let has_selection = self.selected.is_some();
+        let has_more = (self.problems.len() as u32) < self.total;
+        let slug = self.selected.clone().unwrap_or_default();
+
+        let catalog: [(Action, &str, String, String, bool); 9] = [
+            (
+                Action::ToggleTheme,
+                Action::ToggleTheme.search_label(),
+                format!("switch to {} mode", theme.toggled().label()),
+                theme.toggled().icon().to_string(),
+                true,
+            ),
+            (
+                Action::SelectProblem,
+                Action::SelectProblem.search_label(),
+                "Ctrl+P problem selector".to_string(),
+                glyphs::BULLET.to_string(),
+                true,
+            ),
+            (
+                Action::RefreshProblems,
+                Action::RefreshProblems.search_label(),
+                "refetch the first page".to_string(),
+                glyphs::REFRESH.to_string(),
+                true,
+            ),
+            (
+                Action::LoadMore,
+                Action::LoadMore.search_label(),
+                "fetch the next page".to_string(),
+                glyphs::BULLET.to_string(),
+                has_more,
+            ),
+            (
+                Action::ClearFilters,
+                Action::ClearFilters.search_label(),
+                "reset search, difficulty and status".to_string(),
+                glyphs::BULLET.to_string(),
+                self.list_state.is_filtered(),
+            ),
+            (
+                Action::TogglePremiumFilter,
+                Action::TogglePremiumFilter.search_label(),
+                if self.list_state.hide_premium {
+                    "currently hidden".to_string()
+                } else {
+                    "currently shown".to_string()
+                },
+                glyphs::PREMIUM.to_string(),
+                true,
+            ),
+            (
+                Action::OpenOnLeetCode,
+                Action::OpenOnLeetCode.search_label(),
+                slug.clone(),
+                glyphs::BULLET.to_string(),
+                has_selection,
+            ),
+            (
+                Action::CopyProblemLink,
+                Action::CopyProblemLink.search_label(),
+                slug,
+                glyphs::BULLET.to_string(),
+                has_selection,
+            ),
+            (
+                Action::Quit,
+                Action::Quit.search_label(),
+                String::new(),
+                glyphs::BULLET.to_string(),
+                true,
+            ),
+        ];
+
+        catalog
+            .into_iter()
+            .filter(|(_, _, _, _, enabled)| *enabled)
+            .map(|(action, label, hint, icon, _)| {
+                (
+                    action,
+                    PaletteEntry::new(label).with_hint(hint).with_icon(icon),
+                )
+            })
+            .collect()
+    }
+
+    fn run_action(&mut self, action: Action, ctx: &egui::Context) {
+        match action {
+            Action::ToggleTheme => {
+                let next = self.config.theme.toggled();
+                self.set_theme(next, ctx);
+            }
+            Action::SelectProblem => self.problems_palette.open(),
+            Action::RefreshProblems => self.load_first_page(),
+            Action::LoadMore => self.load_next_page(),
+            Action::ClearFilters => self.list_state.clear_filters(),
+            Action::TogglePremiumFilter => {
+                self.list_state.hide_premium = !self.list_state.hide_premium;
+            }
+            Action::OpenOnLeetCode => {
+                if let Some(slug) = self.selected.clone() {
+                    let url = problem_url(&slug);
+                    if let Err(err) = open_in_browser(&url) {
+                        self.error = Some(err);
+                    }
+                }
+            }
+            Action::CopyProblemLink => {
+                if let Some(slug) = self.selected.clone() {
+                    let url = problem_url(&slug);
+                    ctx.copy_text(url.clone());
+                    self.status = format!("Copied {url}");
+                }
+            }
+            Action::Quit => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Draw `Ctrl+K` (actions) and `Ctrl+P` (problem selector).
+    fn show_palettes(&mut self, ctx: &egui::Context) {
+        // -- Ctrl+K: actions ------------------------------------------------
+        let catalog = self.action_catalog();
+        let entries: Vec<PaletteEntry> = catalog.iter().map(|(_, e)| e.clone()).collect();
+
+        let outcome = ui::palette::show(
+            ctx,
+            &mut self.actions_palette,
+            "actions",
+            "Type a command…",
+            &entries,
+            None,
+        );
+        if let Some(index) = resolve_palette_choice(&mut self.actions_palette, &outcome) {
+            if let Some((action, _)) = catalog.get(index) {
+                self.run_action(*action, ctx);
+            }
+        }
+
+        // -- Ctrl+P: problem selector ---------------------------------------
+        if self.problems_palette.is_open() {
+            let query = self.problems_palette.query().to_string();
+            let cap = self.problems.len().min(MAX_PALETTE_PROBLEMS);
+            let entries: Vec<PaletteEntry> = self.problems[..cap]
+                .iter()
+                .map(|problem| {
+                    PaletteEntry::new(format!("{}. {}", problem.id, problem.title))
+                        .with_hint(format!(
+                            "{} · {}",
+                            problem.difficulty.label(),
+                            problem.status.label()
+                        ))
+                        .with_icon(problem.status.marker().to_string())
+                })
+                .collect();
+
+            let search_label = if query.trim().len() >= 2 {
+                Some(format!("Search LeetCode for “{}”", query.trim()))
+            } else {
+                None
+            };
+
+            let outcome = ui::palette::show(
+                ctx,
+                &mut self.problems_palette,
+                "problems",
+                "Jump to a problem…",
+                &entries,
+                search_label.as_deref(),
+            );
+
+            if outcome.empty_action {
+                self.search_problems(query.trim().to_string());
+                self.problems_palette.close();
+            }
+            if let Some(index) = resolve_palette_choice(&mut self.problems_palette, &outcome) {
+                if let Some(problem) = self.problems.get(index) {
+                    let slug = problem.slug.clone();
+                    self.open_problem(slug);
+                }
+            }
+        }
+    }
+
+    /// True while any palette is open, so global shortcuts stand down.
+    fn palette_open(&self) -> bool {
+        self.actions_palette.is_open() || self.problems_palette.is_open()
+    }
+
     // -- theme --------------------------------------------------------------
 
     /// Switch colour scheme, persist the choice and report it in the status bar.
@@ -362,6 +661,34 @@ impl eframe::App for LeetrApp {
             ui.ctx().request_repaint_after(Duration::from_millis(80));
         }
 
+        // Global shortcuts.
+        //
+        // `consume_key` matches against the *event's own* modifiers rather than
+        // `InputState::modifiers` (the live key state). That matters: with a
+        // fast synthetic or human key sequence the modifier can already be
+        // released by the time the frame runs, in which case checking
+        // `i.modifiers` silently misses the shortcut. Consuming the event also
+        // stops a focused `TextEdit` from acting on it (egui binds Ctrl+K to
+        // "delete to end of line").
+        //
+        // `Modifiers::COMMAND` is Ctrl on Linux/Windows and Cmd on macOS.
+        // Shortcuts stand down while a palette is open so it keeps focus.
+        if !self.palette_open() {
+            let open_actions = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K));
+            let open_problems = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
+
+            if open_actions {
+                self.actions_palette.open();
+            }
+            if open_problems {
+                self.problems_palette.open();
+            }
+        }
+
         egui::Panel::top("leetr-toolbar").show(ui, |ui| {
             ui.add_space(2.0);
             self.toolbar(ui);
@@ -410,6 +737,7 @@ impl eframe::App for LeetrApp {
         });
 
         self.handle_list_action(action);
+        self.show_palettes(ui.ctx());
     }
 }
 
@@ -457,4 +785,181 @@ pub fn run() -> anyhow::Result<()> {
         Box::new(|cc| Ok(Box::new(LeetrApp::new(cc)))),
     )
     .map_err(|err| anyhow::anyhow!("failed to start the window: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::palette;
+    use egui::{Event, Key, Modifiers, RawInput};
+
+    /// Build a one-shot `RawInput` whose *live* modifier state is `live` while
+    /// the key event itself carries `event_modifiers`.
+    fn raw_input(key: Key, event_modifiers: Modifiers, live: Modifiers) -> RawInput {
+        RawInput {
+            events: vec![
+                Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: event_modifiers,
+                },
+                // The modifier is released before the frame runs — exactly what
+                // a fast (synthetic or human) key sequence looks like.
+                Event::ModifiersChanged(live),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Regression test for a real bug.
+    ///
+    /// `Ctrl+K` did nothing because the check used `InputState::modifiers`
+    /// (the *live* key state), which had already been reset to `NONE` by the
+    /// time the frame ran. `consume_key` matches the event's own modifiers.
+    #[test]
+    fn consume_key_matches_the_event_modifiers_not_the_live_key_state() {
+        let ctx = egui::Context::default();
+
+        let mut naive = false;
+        let mut robust = false;
+        let mut output = ctx.run_ui(
+            raw_input(Key::K, Modifiers::COMMAND, Modifiers::NONE),
+            |_ui| {
+                naive = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::K));
+                robust = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K));
+            },
+        );
+        output.textures_delta.clear();
+
+        assert!(
+            !naive,
+            "the live modifier state is stale here — checking it is the bug"
+        );
+        assert!(
+            robust,
+            "consume_key must match on the event's own modifiers"
+        );
+    }
+
+    #[test]
+    fn plain_keys_do_not_trigger_command_shortcuts() {
+        let ctx = egui::Context::default();
+        let mut triggered = false;
+        let mut output = ctx.run_ui(raw_input(Key::K, Modifiers::NONE, Modifiers::NONE), |_ui| {
+            triggered = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K));
+        });
+        output.textures_delta.clear();
+        assert!(!triggered, "K without a modifier must not open the palette");
+    }
+
+    #[test]
+    fn a_shortcut_fires_only_once_per_press() {
+        let ctx = egui::Context::default();
+        let mut first = false;
+        let mut second = false;
+        let mut output = ctx.run_ui(
+            raw_input(Key::P, Modifiers::COMMAND, Modifiers::NONE),
+            |_ui| {
+                first = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P));
+                second = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P));
+            },
+        );
+        output.textures_delta.clear();
+
+        assert!(first);
+        assert!(!second, "a consumed shortcut must not fire twice");
+    }
+
+    #[test]
+    fn choosing_a_row_index_dismisses_the_palette() {
+        let mut state = PaletteState::default();
+        state.open();
+
+        let outcome = PaletteOutcome {
+            chosen: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(resolve_palette_choice(&mut state, &outcome), Some(3));
+        assert!(!state.is_open(), "choosing must close the palette");
+    }
+
+    #[test]
+    fn closing_without_choosing_leaves_nothing_selected() {
+        let mut state = PaletteState::default();
+        state.open();
+
+        let outcome = PaletteOutcome {
+            closed: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_palette_choice(&mut state, &outcome), None);
+        assert!(!state.is_open());
+    }
+
+    #[test]
+    fn an_open_palette_with_no_action_stays_open() {
+        let mut state = PaletteState::default();
+        state.open();
+
+        assert_eq!(
+            resolve_palette_choice(&mut state, &PaletteOutcome::default()),
+            None
+        );
+        assert!(state.is_open(), "typing must not close the palette");
+    }
+
+    #[test]
+    fn problem_urls_point_at_leetcode() {
+        assert_eq!(
+            problem_url("two-sum"),
+            "https://leetcode.com/problems/two-sum/"
+        );
+    }
+
+    #[test]
+    fn every_action_has_a_distinct_non_empty_label() {
+        let mut labels: Vec<&str> = ALL_ACTIONS.iter().map(|a| a.search_label()).collect();
+        assert!(labels.iter().all(|l| !l.trim().is_empty()));
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "action labels must be unique");
+    }
+
+    /// The labels have to actually match what a user would type, otherwise the
+    /// palette looks broken even though the plumbing works.
+    #[test]
+    fn searching_for_theme_finds_the_toggle() {
+        let labels: Vec<&str> = ALL_ACTIONS.iter().map(|a| a.search_label()).collect();
+        let ranked = palette::rank("theme", &labels);
+        assert_eq!(
+            ranked.first(),
+            Some(&0),
+            "Toggle theme should rank first: {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn searching_for_expected_words_finds_their_actions() {
+        let labels: Vec<&str> = ALL_ACTIONS.iter().map(|a| a.search_label()).collect();
+        for (query, expected) in [
+            ("theme", Action::ToggleTheme),
+            ("reload", Action::RefreshProblems),
+            ("more", Action::LoadMore),
+            ("filters", Action::ClearFilters),
+            ("premium", Action::TogglePremiumFilter),
+            ("copy", Action::CopyProblemLink),
+            ("quit", Action::Quit),
+        ] {
+            let ranked = palette::rank(query, &labels);
+            let found = ranked.first().map(|&index| ALL_ACTIONS[index]);
+            assert_eq!(
+                found,
+                Some(expected),
+                "query {query:?} should surface {expected:?}, got {found:?}"
+            );
+        }
+    }
 }
