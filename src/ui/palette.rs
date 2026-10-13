@@ -8,9 +8,9 @@ use egui::text::LayoutJob;
 use egui::{Color32, FontId, Key, RichText, TextEdit, TextFormat, Ui};
 
 /// Width of the palette popup.
-const PALETTE_WIDTH: f32 = 620.0;
+const PALETTE_WIDTH: f32 = 680.0;
 /// Height of the scrollable result list.
-const LIST_HEIGHT: f32 = 330.0;
+const LIST_HEIGHT: f32 = 400.0;
 /// Upper bound on rendered rows, so a 4000-entry list stays instant.
 const MAX_ROWS: usize = 200;
 
@@ -249,28 +249,41 @@ pub fn show(
     // Build on `Modal::default_area` rather than a bare `Area`: it carries
     // `UiKind::Modal` and `Order::Foreground`, without which the modal is not
     // drawn above the panels.
+    let popup_frame = egui::Frame::popup(&egui::Style::default())
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(14))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(90),
+        });
+
     let response = egui::Modal::new(modal_id)
-        .backdrop_color(Color32::from_black_alpha(120))
+        .backdrop_color(Color32::from_black_alpha(150))
+        .frame(popup_frame)
         .area(egui::Modal::default_area(modal_id).fixed_pos(position))
         .show(ctx, |ui| {
             let mut outcome = PaletteOutcome::default();
             let mut empty_action_clicked = false;
             ui.set_width(PALETTE_WIDTH);
 
-            let edit = ui.add(
-                TextEdit::singleline(&mut state.query)
-                    .id(modal_id.with("query"))
-                    .hint_text(placeholder)
-                    .desired_width(f32::INFINITY),
-            );
-            if std::mem::take(&mut state.grab_focus) {
-                edit.request_focus();
-            }
-            if edit.changed() {
-                state.selected = 0;
-            }
+            ui.horizontal(|ui| {
+                let edit = ui.add(
+                    TextEdit::singleline(&mut state.query)
+                        .id(modal_id.with("query"))
+                        .hint_text(placeholder)
+                        .desired_width(f32::INFINITY),
+                );
+                if std::mem::take(&mut state.grab_focus) {
+                    edit.request_focus();
+                }
+                if edit.changed() {
+                    state.selected = 0;
+                }
+            });
 
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.separator();
 
             egui::ScrollArea::vertical()
