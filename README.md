@@ -35,7 +35,7 @@ Under active construction. Everything is developed in small, reviewable feature 
 | App shell (egui/eframe) | ✅ |
 | Config + credentials handling | ✅ |
 | Dark mode | ✅ |
-| LeetCode API client | 🚧 |
+| LeetCode API client + CLI | ✅ |
 | Problem list + statement viewer | 🚧 |
 | `Ctrl+P` / `Ctrl+K` command palettes | 🚧 |
 | Workspace files + boilerplate + in-app editor | 🚧 |
@@ -62,6 +62,25 @@ The first run writes default config files:
 ```
 
 Solution workspaces live in `~/.local/share/leetr/workspace/`.
+
+## CLI
+
+The same API client is available headlessly, which is handy on its own and for
+scripting from nvim:
+
+```bash
+leetr list --limit 20 --slug          # browse problems
+leetr list --todo --search matrix     # filter (needs credentials)
+leetr list --solved --limit 100       # only what you've solved
+leetr show two-sum                    # print the statement as plain text
+leetr show two-sum --raw              # print the raw statement HTML
+leetr languages                       # supported submission languages
+leetr whoami                          # verify the configured session
+```
+
+`leetr show` renders LeetCode's HTML statement into readable terminal text
+(decoded entities, `10^4` superscripts, monospaced examples, bulleted
+constraints) — the same renderer the GUI uses.
 
 ## Credentials
 
