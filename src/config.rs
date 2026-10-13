@@ -13,12 +13,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::theme::Theme;
+
 pub const APP_NAME: &str = "leetr";
 
 /// Placeholder written into a freshly seeded credentials file.
 pub const PLACEHOLDER: &str = "REPLACE_ME";
 
 pub const CONFIG_TEMPLATE: &str = r#"# Leetr configuration.
+
+# Colour scheme: "dark" or "light".
+theme = "dark"
 
 # Language slug used when a problem is opened for the first time.
 # Any slug from LeetCode's languageList works, e.g. "python3", "rust", "cpp".
@@ -79,6 +84,7 @@ pub struct FilePaths {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub theme: Theme,
     pub default_language: String,
     pub interop_port: u16,
     pub allow_unsolved_submit: bool,
@@ -90,6 +96,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            theme: Theme::Dark,
             default_language: "python3".to_string(),
             interop_port: 9527,
             allow_unsolved_submit: false,
@@ -114,6 +121,20 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         Ok(cfg)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.save_to(&config_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let text = toml::to_string_pretty(self)?;
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
     }
 }
 
@@ -217,6 +238,7 @@ mod tests {
     #[test]
     fn default_config_is_sane() {
         let cfg = Config::default();
+        assert_eq!(cfg.theme, Theme::Dark);
         assert_eq!(cfg.default_language, "python3");
         assert_eq!(cfg.interop_port, 9527);
         assert!(
@@ -224,6 +246,41 @@ mod tests {
             "solved-guard must default to on"
         );
         assert_eq!(cfg.problem_list_page_size, 50);
+    }
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let dir = tmpdir("cfg-rt");
+        let path = dir.join("config.toml");
+        let cfg = Config {
+            theme: Theme::Light,
+            default_language: "rust".into(),
+            interop_port: 1234,
+            allow_unsolved_submit: true,
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded, cfg);
+        assert_eq!(loaded.theme, Theme::Light);
+    }
+
+    #[test]
+    fn missing_theme_falls_back_to_dark() {
+        let dir = tmpdir("cfg-no-theme");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "default_language = \"go\"\n").unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.theme, Theme::Dark);
+    }
+
+    #[test]
+    fn seeded_config_template_parses_back_to_defaults() {
+        let dir = tmpdir("cfg-template");
+        let paths = seed_at(&dir).unwrap();
+        let cfg = Config::load_from(&paths.config).unwrap();
+        assert_eq!(cfg, Config::default());
     }
 
     #[test]
