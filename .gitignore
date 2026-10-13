@@ -1,0 +1,10 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Internal planning docs — intentionally not published
+.plans/
+
+# Local scratch
+*.log
+.env
