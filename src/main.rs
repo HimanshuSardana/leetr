@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod theme;
 mod ui;
 
 use anyhow::Result;

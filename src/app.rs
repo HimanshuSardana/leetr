@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::config::{self, Config, Credentials};
+use crate::theme::Theme;
 use crate::ui;
 
 pub struct LeetrApp {
@@ -14,9 +15,6 @@ pub struct LeetrApp {
 
 impl LeetrApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Light visuals for now — dark mode arrives in its own feature.
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
-
         let mut error = None;
         if let Err(err) = config::seed() {
             error = Some(format!("could not write config files: {err}"));
@@ -27,6 +25,9 @@ impl LeetrApp {
             Config::default()
         });
         let credentials = Credentials::load();
+
+        // Restore the persisted colour scheme before the first frame.
+        config.theme.apply(&cc.egui_ctx);
 
         let status = if credentials.is_configured() {
             "Ready — credentials loaded".to_string()
@@ -42,7 +43,23 @@ impl LeetrApp {
         }
     }
 
+    /// Switch colour scheme, persist the choice and report it in the status bar.
+    pub fn set_theme(&mut self, theme: Theme, ctx: &egui::Context) {
+        self.config.theme = theme;
+        theme.apply(ctx);
+        match self.config.save() {
+            Ok(()) => {
+                self.error = None;
+                self.status = format!("{} mode enabled", theme.label());
+            }
+            Err(err) => self.error = Some(format!("could not save config: {err}")),
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let theme = self.config.theme;
+        let mut requested_theme = None;
+
         ui.horizontal(|ui| {
             ui.heading("Leetr");
             ui.separator();
@@ -51,10 +68,24 @@ impl LeetrApp {
                     .weak()
                     .small(),
             );
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
+                ui.separator();
+
+                let toggle = ui
+                    .button(format!("{} {}", theme.icon(), theme.label()))
+                    .on_hover_text(format!("Switch to {} mode", theme.toggled().label()));
+                if toggle.clicked() {
+                    requested_theme = Some(theme.toggled());
+                }
             });
         });
+
+        if let Some(next) = requested_theme {
+            let ctx = ui.ctx().clone();
+            self.set_theme(next, &ctx);
+        }
     }
 
     fn problem_panel(&mut self, ui: &mut egui::Ui) {

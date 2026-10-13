@@ -34,7 +34,7 @@ Under active construction. Everything is developed in small, reviewable feature 
 | --- | --- |
 | App shell (egui/eframe) | ✅ |
 | Config + credentials handling | ✅ |
-| Dark mode | 🚧 |
+| Dark mode | ✅ |
 | LeetCode API client | 🚧 |
 | Problem list + statement viewer | 🚧 |
 | `Ctrl+P` / `Ctrl+K` command palettes | 🚧 |
