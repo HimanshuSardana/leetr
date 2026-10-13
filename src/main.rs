@@ -53,13 +53,16 @@ fn main() -> Result<()> {
             println!("config       {}", paths.config.display());
             println!("credentials  {}", paths.credentials.display());
         }
-        Some("nvim-plugin") => match nvim::default_plugin_path() {
-            Some(path) => {
-                println!("{}", path.display());
-                println!("bundled source: {}", env!("CARGO_MANIFEST_DIR"));
-            }
-            None => println!("{}", env!("CARGO_MANIFEST_DIR")),
-        },
+        Some("nvim-plugin") => {
+            // The plugin is embedded in the binary (`include_str!`), so there is
+            // no meaningful "source path" to print — CARGO_MANIFEST_DIR is the
+            // machine that built the binary and usually does not exist for the
+            // person running it.
+            let dest = nvim::default_plugin_path()
+                .ok_or_else(|| anyhow::anyhow!("could not locate your config directory"))?;
+            println!("{}", dest.display());
+            println!("the plugin is embedded in this binary; install it with `leetr install-nvim-plugin`");
+        }
         Some("install-nvim-plugin") => cmd_install_nvim_plugin()?,
         Some(_) => run_command(&args)?,
     }
@@ -79,11 +82,7 @@ fn cmd_install_nvim_plugin() -> Result<()> {
     }
 
     println!();
-    println!("Add this to your nvim config:");
-    println!("  {}", nvim::setup_snippet());
-    println!();
-    println!("Then, in a Leetr workspace file:");
-    println!("  :LeetrStatus  :LeetrOpen <slug>  :LeetrPull  :LeetrPush");
+    print!("{}", nvim::install_hint());
     Ok(())
 }
 
