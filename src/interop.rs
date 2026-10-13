@@ -47,6 +47,9 @@ pub struct Snapshot {
     pub ready: bool,
     /// Free-form status line, mirrored from the app.
     pub status: String,
+    /// Latest judge result, if any.
+    #[serde(default)]
+    pub judge: Option<JudgeSummary>,
     pub version: String,
 }
 
@@ -61,6 +64,20 @@ pub enum Command {
     },
     /// Open a problem.
     Open { slug: String },
+    /// Run the sample tests for the current buffer.
+    Run,
+    /// Submit the current buffer.
+    Submit,
+}
+
+/// The latest judge result, mirrored for the plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeSummary {
+    pub is_submission: bool,
+    pub running: bool,
+    pub verdict: String,
+    pub summary: String,
+    pub error: Option<String>,
 }
 
 /// Requests accepted from the nvim plugin.
@@ -293,7 +310,23 @@ fn handle(mut request: tiny_http::Request, shared: &Shared) -> Result<()> {
             Ok(_) => respond_error(request, 400, "`slug` must not be empty"),
             Err(err) => respond_error(request, 400, &format!("invalid JSON body: {err}")),
         },
-        (_, "/health" | "/state" | "/code" | "/open") => {
+        (Method::Post, "/run") => {
+            shared.push(Command::Run);
+            respond_json(
+                request,
+                202,
+                serde_json::json!({ "ok": true, "queued": true }),
+            )
+        }
+        (Method::Post, "/submit") => {
+            shared.push(Command::Submit);
+            respond_json(
+                request,
+                202,
+                serde_json::json!({ "ok": true, "queued": true }),
+            )
+        }
+        (_, "/health" | "/state" | "/code" | "/open" | "/run" | "/submit") => {
             respond_error(request, 405, "method not allowed")
         }
         _ => respond_error(request, 404, "no such endpoint"),
@@ -424,7 +457,7 @@ mod tests {
             ready: true,
             status: "ok".into(),
             version: API_VERSION.into(),
-            file: None,
+            ..Snapshot::default()
         });
 
         let (status, parsed) = request(server.port(), "GET", "/state", None);
@@ -542,6 +575,36 @@ mod tests {
                 slug: "two-sum".into()
             }]
         );
+    }
+
+    #[test]
+    fn run_and_submit_are_queued() {
+        let (server, shared) = server();
+        assert_eq!(request(server.port(), "POST", "/run", None).0, 202);
+        assert_eq!(request(server.port(), "POST", "/submit", None).0, 202);
+        assert_eq!(shared.take_commands(), vec![Command::Run, Command::Submit]);
+    }
+
+    #[test]
+    fn the_judge_result_is_exposed_over_the_api() {
+        let (server, shared) = server();
+        shared.publish(Snapshot {
+            judge: Some(JudgeSummary {
+                is_submission: true,
+                running: false,
+                verdict: "Accepted".into(),
+                summary: "Accepted · 40 ms".into(),
+                error: None,
+            }),
+            ..Snapshot::default()
+        });
+
+        let (status, body) = request(server.port(), "GET", "/state", None);
+        assert_eq!(status, 200);
+        let parsed: Snapshot = serde_json::from_str(&body).unwrap();
+        let judge = parsed.judge.expect("judge summary");
+        assert_eq!(judge.verdict, "Accepted");
+        assert!(judge.is_submission);
     }
 
     #[test]
