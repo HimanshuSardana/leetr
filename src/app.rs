@@ -14,7 +14,8 @@ use crate::glyphs;
 use crate::interop::{self, Command as InteropCommand, Shared as InteropShared, Snapshot};
 use crate::leetcode::client::ProblemQuery;
 use crate::leetcode::html::{self, Block};
-use crate::leetcode::{ensure_submittable, JudgeResult, LeetCodeClient, Verdict};
+use crate::leetcode::submit::submission_policy;
+use crate::leetcode::{JudgeResult, LeetCodeClient, SubmitDecision, Verdict};
 use crate::model::{Problem, ProblemPage, QuestionDetail, UserStatus};
 use crate::nvim;
 use crate::theme::Theme;
@@ -39,6 +40,8 @@ enum ApiEvent {
         is_submission: bool,
         slug: String,
         result: Job<Box<JudgeResult>>,
+        /// Carried through so the finished result can still show the warning.
+        override_warning: Option<String>,
     },
     Detail {
         slug: String,
@@ -445,9 +448,11 @@ impl LeetrApp {
                     is_submission,
                     slug,
                     result,
+                    override_warning,
                 } => match result {
                     Ok(result) => {
-                        let view = JudgeView::from_result(&result, is_submission);
+                        let mut view = JudgeView::from_result(&result, is_submission);
+                        view.warning = override_warning;
                         self.status = view.summary.clone();
                         if self.error.is_none() {
                             self.error = None;
@@ -464,6 +469,7 @@ impl LeetrApp {
                         self.judge = Some(JudgeView {
                             is_submission,
                             error: Some(err),
+                            warning: override_warning,
                             ..JudgeView::default()
                         });
                     }
@@ -615,6 +621,8 @@ impl LeetrApp {
             return;
         };
 
+        let mut override_warning: Option<String> = None;
+
         if is_submission {
             // Refuse to submit to a problem that is not already solved. This is
             // the safety rail requested when the project was set up.
@@ -631,22 +639,27 @@ impl LeetrApp {
                 self.status = "submission blocked".to_string();
                 return;
             }
-            if let Err(err) =
-                ensure_submittable(&slug, &self.solved, self.config.allow_unsolved_submit)
-            {
-                self.judge = Some(JudgeView {
-                    is_submission,
-                    error: Some(err.to_string()),
-                    ..JudgeView::default()
-                });
-                self.status = "submission blocked".to_string();
-                return;
+            // The decision also carries a warning when the guard is off, so
+            // submitting to an unsolved problem is never silent.
+            match submission_policy(&slug, &self.solved, self.config.allow_unsolved_submit) {
+                SubmitDecision::Allowed => {}
+                SubmitDecision::AllowedByOverride(warning) => override_warning = Some(warning),
+                SubmitDecision::Refused(reason) => {
+                    self.judge = Some(JudgeView {
+                        is_submission,
+                        error: Some(reason),
+                        ..JudgeView::default()
+                    });
+                    self.status = "submission blocked".to_string();
+                    return;
+                }
             }
         }
 
         self.judge = Some(JudgeView {
             is_submission,
             running: true,
+            warning: override_warning.clone(),
             summary: if is_submission {
                 "Submitting…".to_string()
             } else {
@@ -683,6 +696,7 @@ impl LeetrApp {
                 is_submission,
                 slug,
                 result: outcome,
+                override_warning,
             }
         });
     }
@@ -791,6 +805,7 @@ impl LeetrApp {
                 verdict: judge.verdict.label().to_string(),
                 summary: judge.summary.clone(),
                 error: judge.error.clone(),
+                warning: judge.warning.clone(),
             }),
         };
         self.interop_shared.publish(snapshot);

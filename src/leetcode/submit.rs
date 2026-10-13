@@ -23,25 +23,81 @@ use super::client::LeetCodeClient;
 pub const JUDGE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(700);
 
+/// What Leetr will do with a submission request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitDecision {
+    /// The problem is in the solved set.
+    Allowed,
+    /// The problem is **not** solved, but the guard was switched off in
+    /// `config.toml`. Carries the warning to show the user, so disabling the
+    /// safety rail is never silent.
+    AllowedByOverride(String),
+    /// Refused, with the user-facing reason.
+    Refused(String),
+}
+
+impl SubmitDecision {
+    pub fn is_allowed(&self) -> bool {
+        !matches!(self, Self::Refused(_))
+    }
+
+    /// Message to surface when the request proceeds despite the guard.
+    pub fn warning(&self) -> Option<&str> {
+        match self {
+            Self::AllowedByOverride(warning) => Some(warning),
+            _ => None,
+        }
+    }
+
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            Self::Refused(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Decide whether a submission to `slug` may proceed.
+///
+/// This is the safety rail: Leetr will not send a first attempt at a problem it
+/// thinks is unsolved. `allow_unsolved` (from `config.toml`) disables it — and
+/// when it does, the decision records a warning rather than passing silently.
+pub fn submission_policy(
+    slug: &str,
+    solved: &BTreeSet<String>,
+    allow_unsolved: bool,
+) -> SubmitDecision {
+    if solved.contains(slug) {
+        return SubmitDecision::Allowed;
+    }
+
+    if allow_unsolved {
+        return SubmitDecision::AllowedByOverride(format!(
+            "submitting to `{slug}`, which is not in your solved set — the guard is \
+             disabled by `allow_unsolved_submit = true` in config.toml"
+        ));
+    }
+
+    SubmitDecision::Refused(format!(
+        "refusing to submit to `{slug}`: it is not in your solved set. \
+         Leetr only submits to problems you have already solved — \
+         set `allow_unsolved_submit = true` in config.toml to override."
+    ))
+}
+
 /// Refuse a submission to a problem that is not already solved.
 ///
-/// This is the safety rail requested by the user: Leetr will not send a first
-/// attempt at a problem it thinks is unsolved. `allow_unsolved` (from
-/// `config.toml`) turns it off.
+/// Thin wrapper over [`submission_policy`] for callers that only care whether
+/// the request is allowed.
 pub fn ensure_submittable(
     slug: &str,
     solved: &BTreeSet<String>,
     allow_unsolved: bool,
 ) -> Result<()> {
-    if allow_unsolved || solved.contains(slug) {
-        return Ok(());
+    match submission_policy(slug, solved, allow_unsolved) {
+        SubmitDecision::Refused(reason) => bail!("{reason}"),
+        _ => Ok(()),
     }
-
-    bail!(
-        "refusing to submit to `{slug}`: it is not in your solved set. \
-         Leetr only submits to problems you have already solved — \
-         set `allow_unsolved_submit = true` in config.toml to override."
-    )
 }
 
 /// Outcome of a judge run.
@@ -543,6 +599,53 @@ mod tests {
     #[test]
     fn the_override_permits_unsolved_submissions() {
         assert!(ensure_submittable("anything", &BTreeSet::new(), true).is_ok());
+    }
+
+    #[test]
+    fn a_solved_problem_is_allowed_without_a_warning() {
+        let decision = submission_policy("two-sum", &solved(), false);
+        assert_eq!(decision, SubmitDecision::Allowed);
+        assert!(decision.is_allowed());
+        assert!(decision.warning().is_none());
+    }
+
+    #[test]
+    fn the_override_is_allowed_but_never_silent() {
+        let decision = submission_policy("not-solved", &solved(), true);
+        assert!(decision.is_allowed());
+        assert!(decision.refusal().is_none());
+
+        let warning = decision
+            .warning()
+            .expect("disabling the guard must produce a warning");
+        assert!(warning.contains("not-solved"), "got: {warning}");
+        assert!(
+            warning.contains("allow_unsolved_submit = true"),
+            "got: {warning}"
+        );
+    }
+
+    #[test]
+    fn an_unsolved_problem_is_refused_without_the_override() {
+        let decision = submission_policy("not-solved", &solved(), false);
+        assert!(!decision.is_allowed());
+        assert!(decision.warning().is_none());
+        assert!(decision
+            .refusal()
+            .expect("refusal reason")
+            .contains("refusing to submit"));
+    }
+
+    #[test]
+    fn the_override_still_refuses_nothing_but_warns() {
+        // Regression guard for a real incident: a local config edit had
+        // `allow_unsolved_submit = true`, so a submission went to an unsolved
+        // problem with no signal at all that the rail was off.
+        let decision = submission_policy("median-of-two-sorted-arrays", &solved(), true);
+        assert!(
+            decision.warning().is_some(),
+            "the override must be visible to the user"
+        );
     }
 
     // -- verdicts -----------------------------------------------------------
