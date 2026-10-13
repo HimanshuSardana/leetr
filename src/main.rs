@@ -6,6 +6,7 @@ use leetr::config::{self, Credentials};
 use leetr::leetcode::client::ProblemQuery;
 use leetr::leetcode::{html, LeetCodeClient};
 use leetr::model::{ProblemStatus, QuestionDetail};
+use leetr::nvim;
 
 const HELP: &str = "\
 leetr — a lightweight egui LeetCode client
@@ -21,6 +22,7 @@ COMMANDS:
     whoami                  Show the configured LeetCode session
     init                    Write default config + credentials files
     nvim-plugin             Print the path to the bundled nvim plugin
+    install-nvim-plugin     Install the nvim plugin into your nvim config
     -h, --help              Print this help
     -V, --version           Print the version
 
@@ -51,10 +53,37 @@ fn main() -> Result<()> {
             println!("config       {}", paths.config.display());
             println!("credentials  {}", paths.credentials.display());
         }
-        Some("nvim-plugin") => println!("{}", env!("CARGO_MANIFEST_DIR")),
+        Some("nvim-plugin") => match nvim::default_plugin_path() {
+            Some(path) => {
+                println!("{}", path.display());
+                println!("bundled source: {}", env!("CARGO_MANIFEST_DIR"));
+            }
+            None => println!("{}", env!("CARGO_MANIFEST_DIR")),
+        },
+        Some("install-nvim-plugin") => cmd_install_nvim_plugin()?,
         Some(_) => run_command(&args)?,
     }
 
+    Ok(())
+}
+
+/// Copy the embedded plugin into the user's nvim config.
+fn cmd_install_nvim_plugin() -> Result<()> {
+    let dest = nvim::default_plugin_path()
+        .ok_or_else(|| anyhow::anyhow!("could not locate your config directory"))?;
+
+    match nvim::install_plugin(&dest) {
+        Ok(true) => println!("installed {}", dest.display()),
+        Ok(false) => println!("already up to date: {}", dest.display()),
+        Err(err) => bail!("{err}"),
+    }
+
+    println!();
+    println!("Add this to your nvim config:");
+    println!("  {}", nvim::setup_snippet());
+    println!();
+    println!("Then, in a Leetr workspace file:");
+    println!("  :LeetrStatus  :LeetrOpen <slug>  :LeetrPull  :LeetrPush");
     Ok(())
 }
 

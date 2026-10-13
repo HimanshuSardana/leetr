@@ -8,8 +8,11 @@
 pub mod app;
 pub mod bg;
 pub mod config;
+pub mod editor;
 pub mod glyphs;
+pub mod interop;
 pub mod leetcode;
 pub mod model;
+pub mod nvim;
 pub mod theme;
 pub mod ui;

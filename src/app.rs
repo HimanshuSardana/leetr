@@ -5,15 +5,21 @@ use std::time::Duration;
 
 use eframe::egui;
 
+use std::sync::Arc;
+
 use crate::bg::Bg;
 use crate::config::{self, Config, Credentials};
+use crate::editor::{Buffer as EditorBuffer, Workspace};
 use crate::glyphs;
+use crate::interop::{self, Command as InteropCommand, Shared as InteropShared, Snapshot};
 use crate::leetcode::client::ProblemQuery;
 use crate::leetcode::html::{self, Block};
 use crate::leetcode::LeetCodeClient;
 use crate::model::{Problem, ProblemPage, QuestionDetail, UserStatus};
+use crate::nvim;
 use crate::theme::Theme;
 use crate::ui;
+use crate::ui::code_editor::{self, LanguageChoice};
 use crate::ui::palette::{PaletteEntry, PaletteOutcome, PaletteState};
 use crate::ui::problem_list::{ProblemListAction, ProblemListState};
 use crate::ui::status_bar::AuthBadge;
@@ -33,6 +39,14 @@ enum ApiEvent {
         result: Job<Box<QuestionDetail>>,
     },
     Session(Job<(UserStatus, BTreeSet<String>)>),
+}
+
+/// Which pane the central area shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    #[default]
+    Statement,
+    Code,
 }
 
 /// Cap on how many loaded problems the `Ctrl+P` palette will offer.
@@ -154,6 +168,17 @@ pub struct LeetrApp {
 
     actions_palette: PaletteState,
     problems_palette: PaletteState,
+
+    workspace: Workspace,
+    code: Option<EditorBuffer>,
+    languages: Vec<LanguageChoice>,
+    tab: Tab,
+    reloaded_from_disk: bool,
+    /// Code pushed over the API before its problem finished loading.
+    pending_code: Option<String>,
+
+    interop_shared: Arc<InteropShared>,
+    interop: Option<interop::RunningServer>,
 }
 
 impl LeetrApp {
@@ -182,6 +207,37 @@ impl LeetrApp {
             }
         };
 
+        let workspace = Workspace::from_config(&config);
+        let interop_shared = Arc::new(InteropShared::new());
+
+        let bind = format!("127.0.0.1:{}", config.interop_port);
+        let interop = match interop::start(&bind, Arc::clone(&interop_shared)) {
+            Ok(server) => Some(server),
+            Err(err) => {
+                // A busy port must not stop the app from starting.
+                match interop::start("127.0.0.1:0", Arc::clone(&interop_shared)) {
+                    Ok(server) => {
+                        error = Some(format!(
+                            "{err}; control API moved to port {}",
+                            server.port()
+                        ));
+                        Some(server)
+                    }
+                    Err(err) => {
+                        error = Some(format!("control API unavailable: {err}"));
+                        None
+                    }
+                }
+            }
+        };
+
+        // Wake the UI whenever the control API queues a command: egui only runs
+        // a frame when asked to, so an idle app would never apply them.
+        {
+            let ctx = cc.egui_ctx.clone();
+            interop_shared.set_waker(Arc::new(move || ctx.request_repaint()));
+        }
+
         let mut app = Self {
             config,
             credentials,
@@ -203,6 +259,14 @@ impl LeetrApp {
             solved: BTreeSet::new(),
             actions_palette: PaletteState::default(),
             problems_palette: PaletteState::default(),
+            workspace,
+            code: None,
+            languages: Vec::new(),
+            tab: Tab::Statement,
+            reloaded_from_disk: false,
+            pending_code: None,
+            interop_shared,
+            interop,
         };
 
         app.refresh_session();
@@ -351,6 +415,12 @@ impl LeetrApp {
                     match result {
                         Ok(detail) => {
                             self.detail_blocks = html::parse(&detail.content_html);
+                            self.languages = code_editor::language_choices(&detail);
+                            let lang = code_editor::preferred_language(
+                                &detail,
+                                &self.config.default_language,
+                            );
+                            self.prepare_workspace(&detail, &lang);
                             self.status = format!("{} · {}", detail.frontend_id, detail.title);
                             self.detail = Some(*detail);
                             self.detail_error = None;
@@ -386,6 +456,262 @@ impl LeetrApp {
                 solved: self.solved.len(),
             },
             _ => AuthBadge::BrowseOnly,
+        }
+    }
+
+    // -- workspace / editor --------------------------------------------------
+
+    /// Create the problem's files and load its buffer, applying any code that
+    /// arrived over the control API while the problem was still loading.
+    fn prepare_workspace(&mut self, detail: &QuestionDetail, lang_slug: &str) {
+        match self.workspace.prepare(detail, lang_slug) {
+            Ok(prepared) => {
+                let boilerplate = detail
+                    .snippet_for(lang_slug)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut buffer = EditorBuffer::load(
+                    prepared.solution.clone(),
+                    &detail.slug,
+                    &detail.frontend_id,
+                    lang_slug,
+                    &boilerplate,
+                );
+
+                if let Some(pushed) = self.pending_code.take() {
+                    buffer.set_text(pushed);
+                    if let Err(err) = buffer.save() {
+                        self.error = Some(format!("could not save pushed code: {err}"));
+                    }
+                }
+
+                self.status = if prepared.created_solution {
+                    format!("created {}", prepared.solution.display())
+                } else {
+                    format!("editing {}", prepared.solution.display())
+                };
+                self.code = Some(buffer);
+            }
+            Err(err) => {
+                self.code = None;
+                self.error = Some(format!("could not prepare the workspace: {err}"));
+            }
+        }
+    }
+
+    fn switch_language(&mut self, lang_slug: String) {
+        let Some(detail) = self.detail.clone() else {
+            return;
+        };
+        if self
+            .code
+            .as_ref()
+            .is_some_and(|buffer| buffer.lang_slug == lang_slug)
+        {
+            return;
+        }
+
+        match self.workspace.prepare(&detail, &lang_slug) {
+            Ok(prepared) => {
+                let boilerplate = detail
+                    .snippet_for(&lang_slug)
+                    .unwrap_or_default()
+                    .to_string();
+                let buffer = EditorBuffer::load(
+                    prepared.solution,
+                    &detail.slug,
+                    &detail.frontend_id,
+                    &lang_slug,
+                    &boilerplate,
+                );
+                self.status = format!("switched to {lang_slug}");
+                self.code = Some(buffer);
+            }
+            Err(err) => self.error = Some(format!("could not switch language: {err}")),
+        }
+    }
+
+    /// Pick up edits made to the workspace file outside the app (nvim `:w`).
+    fn poll_workspace_file(&mut self) {
+        let Some(buffer) = self.code.as_mut() else {
+            return;
+        };
+        match buffer.reload_if_changed() {
+            Ok(true) => {
+                self.reloaded_from_disk = true;
+                self.status = "solution reloaded from disk".to_string();
+            }
+            Ok(false) => {}
+            Err(err) => self.error = Some(format!("could not read the solution file: {err}")),
+        }
+    }
+
+    fn open_in_nvim(&mut self) {
+        let Some(buffer) = self.code.as_ref() else {
+            self.status = "open a problem first".to_string();
+            return;
+        };
+        // Make sure the editor sees what is on screen.
+        let path = buffer.path().to_path_buf();
+        if let Some(buffer) = self.code.as_mut() {
+            if let Err(err) = buffer.save() {
+                self.error = Some(format!("could not save before opening nvim: {err}"));
+                return;
+            }
+        }
+
+        match nvim::open(&path, &self.config.editor_command) {
+            Ok(how) => self.status = format!("opened {path:?} with {how}"),
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    // -- control API ---------------------------------------------------------
+
+    fn apply_interop_commands(&mut self) {
+        for command in self.interop_shared.take_commands() {
+            match command {
+                InteropCommand::Open { slug } => self.open_problem(slug),
+                InteropCommand::SetCode {
+                    slug,
+                    language,
+                    code,
+                } => {
+                    if let Some(language) = language.filter(|lang| !lang.trim().is_empty()) {
+                        self.switch_language(language);
+                    }
+
+                    let same_problem = match (slug.as_deref(), self.selected.as_deref()) {
+                        (Some(incoming), Some(selected)) => incoming == selected,
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                    };
+
+                    if !same_problem {
+                        if let Some(slug) = slug {
+                            // The problem is not loaded yet; stash the code for
+                            // `prepare_workspace` to apply.
+                            self.pending_code = Some(code);
+                            self.open_problem(slug);
+                            continue;
+                        }
+                    }
+
+                    match self.code.as_mut() {
+                        Some(buffer) => {
+                            buffer.set_text(code);
+                            match buffer.save() {
+                                Ok(()) => {
+                                    self.status = "solution synced from the editor".to_string();
+                                    self.error = None;
+                                }
+                                Err(err) => {
+                                    self.error = Some(format!("could not save the solution: {err}"))
+                                }
+                            }
+                        }
+                        None => self.pending_code = Some(code),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Publish what the control API can read.
+    ///
+    /// Called once per frame: the payload is a LeetCode-sized solution, so the
+    /// clone is cheap and it removes a whole class of staleness bugs.
+    fn publish_snapshot(&self) {
+        let snapshot = Snapshot {
+            slug: self.selected.clone(),
+            title: self.detail.as_ref().map(|detail| detail.title.clone()),
+            language: self.code.as_ref().map(|buffer| buffer.lang_slug.clone()),
+            file: self
+                .code
+                .as_ref()
+                .map(|buffer| buffer.path().display().to_string()),
+            code: self
+                .code
+                .as_ref()
+                .map(|buffer| buffer.text.clone())
+                .unwrap_or_default(),
+            solved: self
+                .selected
+                .as_ref()
+                .is_some_and(|slug| self.solved.contains(slug)),
+            ready: self.code.is_some(),
+            status: self.status.clone(),
+            version: interop::API_VERSION.to_string(),
+        };
+        self.interop_shared.publish(snapshot);
+    }
+
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tab, Tab::Statement, "Statement");
+
+            let code_label = match self.code.as_ref() {
+                Some(buffer) => format!("Code · {}", buffer.lang_slug),
+                None => "Code".to_string(),
+            };
+            ui.selectable_value(&mut self.tab, Tab::Code, code_label);
+
+            if let Some(buffer) = self.code.as_ref() {
+                if buffer.is_dirty() {
+                    ui.label(
+                        egui::RichText::new(format!("{} unsaved", glyphs::DOT))
+                            .color(crate::theme::WARNING)
+                            .small(),
+                    );
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let port = self
+                    .interop
+                    .as_ref()
+                    .map(|server| server.port().to_string())
+                    .unwrap_or_else(|| "off".to_string());
+                ui.label(
+                    egui::RichText::new(format!("control API :{port}"))
+                        .weak()
+                        .small(),
+                )
+                .on_hover_text(
+                    "The bundled nvim plugin talks to Leetr on this port\n\
+                     (see `leetr install-nvim-plugin`)",
+                );
+            });
+        });
+    }
+
+    fn code_pane(&mut self, ui: &mut egui::Ui) {
+        let languages = self.languages.clone();
+        let Some(buffer) = self.code.as_mut() else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(egui::RichText::new("Open a problem to get a solution buffer.").weak());
+            });
+            return;
+        };
+
+        let dirty = buffer.is_dirty();
+        let reloaded = self.reloaded_from_disk;
+        let action = code_editor::show(ui, buffer, &languages, dirty, reloaded);
+        self.reloaded_from_disk = false;
+
+        if let Some(language) = action.language {
+            self.switch_language(language);
+        }
+        if action.open_in_nvim {
+            self.open_in_nvim();
+        }
+        if action.changed {
+            if let Some(buffer) = self.code.as_mut() {
+                if let Err(err) = buffer.save() {
+                    self.error = Some(format!("could not save the solution: {err}"));
+                }
+            }
         }
     }
 
@@ -656,9 +982,18 @@ impl LeetrApp {
 impl eframe::App for LeetrApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.apply_interop_commands();
+        self.poll_workspace_file();
 
         if self.list_loading || self.detail_loading {
             ui.ctx().request_repaint_after(Duration::from_millis(80));
+        }
+
+        // With a solution open, keep ticking so an edit saved outside the app
+        // (nvim `:w`) is noticed. Without this, egui would idle and the mtime
+        // check in `poll_workspace_file` would never run.
+        if self.code.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(400));
         }
 
         // Global shortcuts.
@@ -727,17 +1062,23 @@ impl eframe::App for LeetrApp {
             });
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
-            ui::statement::show(
-                ui,
-                self.detail.as_ref(),
-                &self.detail_blocks,
-                self.detail_loading,
-                self.detail_error.as_deref(),
-            );
+            self.tab_bar(ui);
+            ui.add_space(2.0);
+            match self.tab {
+                Tab::Statement => ui::statement::show(
+                    ui,
+                    self.detail.as_ref(),
+                    &self.detail_blocks,
+                    self.detail_loading,
+                    self.detail_error.as_deref(),
+                ),
+                Tab::Code => self.code_pane(ui),
+            }
         });
 
         self.handle_list_action(action);
         self.show_palettes(ui.ctx());
+        self.publish_snapshot();
     }
 }
 

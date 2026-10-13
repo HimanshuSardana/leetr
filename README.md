@@ -38,8 +38,8 @@ Under active construction. Everything is developed in small, reviewable feature 
 | LeetCode API client + CLI | ✅ |
 | Problem list + statement viewer | 🚧 |
 | `Ctrl+P` / `Ctrl+K` command palettes | ✅ |
-| Workspace files + boilerplate + in-app editor | 🚧 |
-| nvim interoperability | 🚧 |
+| Workspace files + boilerplate + in-app editor | ✅ |
+| nvim interoperability | ✅ |
 | Run sample tests + submit | 🚧 |
 
 ## Requirements
@@ -120,21 +120,61 @@ Submitting a solution to a problem that is **not already marked solved** on your
 refused by default. Flip `allow_unsolved_submit = true` in `config.toml` if you want to
 disable the guard.
 
-## nvim interoperability
+## Editing: nvim interoperability
 
-The app hosts a small control API on `127.0.0.1:9527` and ships a nvim plugin
-(`contrib/nvim/leetr.lua`) that talks to it:
+Leetr treats a **file on disk as the source of truth**, so your editor and the app are
+never out of sync:
+
+```
+~/.local/share/leetr/workspace/<id>-<slug>/
+    solution.py     # both Leetr and nvim edit this
+    problem.md      # the statement, readable offline
+    meta.json       # ids/title/language
+```
+
+* Saving in nvim updates Leetr (the app notices the file change and reloads).
+* Editing in Leetr writes the file back, so `:e!` / `:LeetrPull` picks it up.
+* **Open in nvim** in the Code tab launches your editor on the file — inside tmux it opens
+  a split; otherwise it uses `$TERMINAL`; otherwise plain `nvim`. Configure
+  `editor_command` in `config.toml` to override.
+
+### Control API
+
+The app hosts a small API on `127.0.0.1:9527` (configurable), used by the bundled plugin
+and by anything else you want to script:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | liveness + version |
+| `GET` | `/state` | open problem, language, file, code, solved flag |
+| `GET` | `/code` | the current buffer as text |
+| `POST` | `/code` | replace the current buffer |
+| `POST` | `/open` | open a problem by slug |
+
+```bash
+curl -s 127.0.0.1:9527/state
+curl -sS -X POST -H 'Content-Type: application/json' \
+     -d '{"slug":"two-sum"}' 127.0.0.1:9527/open
+```
+
+### nvim plugin
+
+```bash
+leetr install-nvim-plugin     # writes ~/.config/nvim/lua/leetr.lua
+```
+
+Then add `require("leetr").setup()` to your nvim config. Commands:
 
 | nvim command | Effect |
 | --- | --- |
-| `:LeetrOpen <slug>` | open a problem in the app |
-| `:LeetrPull` | load the app's current buffer into nvim |
-| `:LeetrPush` | send the nvim buffer to the app |
-| `:LeetrRun` | run the sample tests |
-| `:LeetrSubmit` | submit the current buffer |
+| `:LeetrStatus` | show what Leetr has open |
+| `:LeetrOpen <slug>` | ask Leetr to open a problem |
+| `:LeetrPull` | load Leetr's buffer into this window |
+| `:LeetrPush` | send this buffer to Leetr |
+| `:LeetrPort <n>` | point the plugin at another port |
 
-Saving in nvim can auto-push, and the app reloads a workspace file when it changes on
-disk — so edits flow both ways without any manual copying.
+Saving a file matching `*/solution.*` pushes it automatically, so the normal flow is just
+`leetr` + `nvim` side by side with no copying at all.
 
 ## License
 

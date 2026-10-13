@@ -123,6 +123,16 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Root directory that holds one sub-directory per problem.
+    pub fn workspace_root(&self) -> PathBuf {
+        let configured = self.workspace_dir.trim();
+        if configured.is_empty() {
+            data_dir().join("workspace")
+        } else {
+            PathBuf::from(expand_tilde(configured))
+        }
+    }
+
     pub fn save(&self) -> Result<()> {
         self.save_to(&config_path())
     }
@@ -188,6 +198,14 @@ impl Credentials {
     }
 }
 
+/// Minimal `~` expansion — enough for a workspace path from the config file.
+fn expand_tilde(path: &str) -> String {
+    match (path.strip_prefix("~/"), dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
 fn is_real(value: &str) -> bool {
     let v = value.trim();
     !v.is_empty() && v != PLACEHOLDER
@@ -195,6 +213,14 @@ fn is_real(value: &str) -> bool {
 
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(APP_NAME)
+}
+
+/// Where solution workspaces live by default
+/// (Linux: `~/.local/share/leetr`).
+pub fn data_dir() -> PathBuf {
+    dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_NAME)
 }
@@ -289,6 +315,41 @@ mod tests {
         let paths = seed_at(&dir).unwrap();
         let cfg = Config::load_from(&paths.config).unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn workspace_root_defaults_under_the_data_dir() {
+        let cfg = Config::default();
+        assert!(cfg.workspace_root().ends_with("leetr/workspace"));
+    }
+
+    #[test]
+    fn workspace_root_honours_an_explicit_path() {
+        let cfg = Config {
+            workspace_dir: "/tmp/leetr-ws".into(),
+            ..Config::default()
+        };
+        assert_eq!(cfg.workspace_root(), PathBuf::from("/tmp/leetr-ws"));
+    }
+
+    #[test]
+    fn workspace_root_expands_a_leading_tilde() {
+        let cfg = Config {
+            workspace_dir: "~/leetr-ws".into(),
+            ..Config::default()
+        };
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(cfg.workspace_root(), home.join("leetr-ws"));
+        }
+    }
+
+    #[test]
+    fn blank_workspace_dir_is_treated_as_unset() {
+        let cfg = Config {
+            workspace_dir: "   ".into(),
+            ..Config::default()
+        };
+        assert!(cfg.workspace_root().ends_with("leetr/workspace"));
     }
 
     #[test]
