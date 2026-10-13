@@ -178,6 +178,14 @@ impl Credentials {
     pub fn is_configured(&self) -> bool {
         is_real(&self.leetcode_session) && is_real(&self.csrftoken)
     }
+
+    /// Value for the HTTP `Cookie` header.
+    pub fn cookie_header(&self) -> String {
+        format!(
+            "LEETCODE_SESSION={}; csrftoken={}",
+            self.leetcode_session, self.csrftoken
+        )
+    }
 }
 
 fn is_real(value: &str) -> bool {
@@ -324,6 +332,18 @@ mod tests {
             csrftoken: "  ".into(),
         };
         assert!(!creds.is_configured());
+    }
+
+    #[test]
+    fn cookie_header_contains_both_cookies() {
+        let creds = Credentials {
+            leetcode_session: "sess".into(),
+            csrftoken: "tok".into(),
+        };
+        assert_eq!(
+            creds.cookie_header(),
+            "LEETCODE_SESSION=sess; csrftoken=tok"
+        );
     }
 
     #[test]
