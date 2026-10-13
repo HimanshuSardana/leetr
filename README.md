@@ -1,108 +1,67 @@
 # Leetr
 
-A **lightweight** desktop LeetCode client written in Rust with
-[`egui`](https://github.com/emilk/egui) — and first-class **nvim interoperability**
-so you never have to copy-paste between your editor and the browser again.
+A **lightweight** desktop LeetCode client in Rust with [`egui`](https://github.com/emilk/egui)
+— and first-class **nvim interoperability** so you never copy-paste between your editor and
+a browser again.
+
+![Browsing problems and reading a statement](docs/browse.png)
+
+No embedded Chromium, no WebKit, no async runtime. One small native binary that reads
+problems, runs your code and submits it, while **your own nvim** does the editing.
 
 ```
-┌ Leetr ────────────────────────────────────────────────────┐
-│ Problems            │ Statement                           │
-│ ▸ 1. Two Sum        │                                     │
-│   2. Add Two Numbers│  Given an array of integers ...      │
-│   3. Longest Sub... │                                     │
-└─────────────────────┴─────────────────────────────────────┘
+$ du -h target/release/leetr    13M
+$ ldd target/release/leetr | wc -l
+5
 ```
 
-## Why
+---
 
-The LeetCode web UI is heavy, and the usual workflow is: read the problem in a browser,
-write the solution in nvim, then paste it back into a web form. Leetr removes the browser
-and the paste step:
+## Features
 
-- browse problems and read full statements in a small native window,
-- solve in **your** nvim (or the built-in lightweight editor),
-- push/pull code between nvim and Leetr over a local control API,
-- run sample tests and submit — from either side.
-
-No embedded Chromium/WebKit. The whole thing is one small native binary.
-
-## Status
-
-Under active construction. Everything is developed in small, reviewable feature PRs.
-
-| Feature | Status |
+| | |
 | --- | --- |
-| App shell (egui/eframe) | ✅ |
-| Config + credentials handling | ✅ |
-| Dark mode | ✅ |
-| LeetCode API client + CLI | ✅ |
-| Problem list + statement viewer | 🚧 |
-| `Ctrl+P` / `Ctrl+K` command palettes | ✅ |
-| Workspace files + boilerplate + in-app editor | ✅ |
-| nvim interoperability | ✅ |
-| Run sample tests + submit | ✅ |
+| **Browse problems** | Virtualised list of 4000+ problems with difficulty, acceptance rate, solved/attempted markers, filters and paging |
+| **Read statements** | LeetCode's HTML rendered as real rich text: inline code, monospace examples, bullets, collapsible hints and starter code |
+| **Submit solutions** | Run sample tests and submit, with a verdict panel showing runtime, produced vs expected output and compile/runtime errors |
+| **nvim interoperability** | Edit in your own nvim; Leetr and nvim share a file on disk plus a loopback control API, so nothing is ever copy-pasted |
+| **Dark mode** | A curated dark theme (default) and a matching light theme, persisted in `config.toml` |
+| **`Ctrl+P`** | Fuzzy problem selector — jump to any loaded problem by id, title or slug |
+| **`Ctrl+K`** | Command palette — theme, reload, filters, links, quit |
+| **Lightweight** | A **13 MB** release binary linking only `libc`, `libm` and `libgcc` — no GTK, no WebKit, no OpenSSL, no async runtime |
 
-## Requirements
+### Command palettes
 
-- Rust 1.82+
-- Linux (X11 or Wayland), macOS, or Windows
-- Optional: `nvim` for the editor integration
+`Ctrl+P` ranks by fuzzy match with bonuses for word boundaries and contiguous runs, so
+`sum` puts **Two Sum** first. When nothing matches locally, an inline
+**"Search LeetCode for …"** action falls back to a server-side search — no per-keystroke
+network traffic.
 
-## Build & run
+![The Ctrl+P problem selector](docs/palette.png)
+
+### Running and submitting
+
+![An accepted submission](docs/judge.png)
+
+---
+
+## Install
 
 ```bash
-cargo run --release
+git clone https://github.com/HimanshuSardana/leetr
+cd leetr
+cargo install --path .          # or: cargo build --release
 ```
 
-The first run writes default config files:
+Requirements: Rust 1.82+, and on Linux the usual windowing headers
+(`libxkbcommon`, `libxcb`, `libx11`, `libwayland`, `libgl`). Optional: `nvim`, `tmux`.
 
-```
-~/.config/leetr/config.toml
-~/.config/leetr/credentials.toml   # see below
-```
-
-Solution workspaces live in `~/.local/share/leetr/workspace/`.
-
-## CLI
-
-The same API client is available headlessly, which is handy on its own and for
-scripting from nvim:
-
-```bash
-leetr list --limit 20 --slug          # browse problems
-leetr list --todo --search matrix     # filter (needs credentials)
-leetr list --solved --limit 100       # only what you've solved
-leetr show two-sum                    # print the statement as plain text
-leetr show two-sum --raw              # print the raw statement HTML
-leetr languages                       # supported submission languages
-leetr whoami                          # verify the configured session
-```
-
-`leetr show` renders LeetCode's HTML statement into readable terminal text
-(decoded entities, `10^4` superscripts, monospaced examples, bulleted
-constraints) — the same renderer the GUI uses.
-
-## Keybindings
-
-| Shortcut | Action |
-| --- | --- |
-| `Ctrl+P` | Problem selector — fuzzy-jump to any loaded problem |
-| `Ctrl+K` | Command palette — theme, reload, filters, links, quit |
-| `Up` / `Down`, `Tab` / `Shift+Tab` | Move the palette selection |
-| `Enter` | Run the highlighted command / open the highlighted problem |
-| `Esc` | Close the palette |
-
-Both palettes fuzzy-match on the label *and* the hint, so `theme`, `reload`,
-`filters` or `quit` all find the right command. They rank word-boundary and
-contiguous matches highest, which is why `sum` puts **Two Sum** first.
-
-If `Ctrl+P` finds nothing locally, an inline **"Search LeetCode for …"** action
-falls back to a server-side search — no per-keystroke network requests.
+The first run writes default config to `~/.config/leetr/`.
 
 ## Credentials
 
-Browsing problems and reading statements works **without** any credentials. Running tests
-and submitting solutions requires a LeetCode session:
+Browsing problems and reading statements needs **nothing**. Running tests and submitting
+needs a LeetCode session:
 
 1. Log in to <https://leetcode.com>.
 2. DevTools (F12) → **Application → Storage → Cookies → `https://leetcode.com`**.
@@ -111,87 +70,66 @@ and submitting solutions requires a LeetCode session:
 4. Restart Leetr — a **signed in** badge appears in the status bar.
 
 Environment variables `LEETCODE_SESSION` and `LEETCODE_CSRFTOKEN` override the file.
+`credentials.toml` lives outside the repository and is never committed.
 
-> `credentials.toml` lives outside the repository and is never committed.
-
-## Running and submitting
-
-The **Code** tab has **Run tests** (sample cases) and **Submit**. Results appear in a panel
-under the editor: verdict, runtime, produced vs expected output, and compile/runtime errors.
-The same actions are available from nvim (`:LeetrRun`, `:LeetrSubmit`, `:LeetrResult`).
-
-Under the hood this uses LeetCode's judge protocol: `POST /problems/{slug}/submit/` (or
-`/interpret_solution/` for sample tests) returns an id, then
-`GET /submissions/detail/{id}/check/` is polled until a verdict is reported.
-
-## Safety rail
-
-Submitting a solution to a problem that is **not already marked solved** on your account is
-refused by default. The refusal happens *before* any request reaches LeetCode, so Leetr can
-never spend an attempt on an unsolved problem:
-
-```
-refusing to submit to `median-of-two-sorted-arrays`: it is not in your solved set.
-Leetr only submits to problems you have already solved —
-set `allow_unsolved_submit = true` in config.toml to override.
+```bash
+leetr whoami    # verifies the session and reports how many problems you've solved
 ```
 
-The Submit button is disabled for unsolved problems too. Flip
-`allow_unsolved_submit = true` in `config.toml` to disable the guard, and note that if the
-solved set has not loaded yet Leetr refuses rather than guessing.
+## Keybindings
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+P` | Problem selector |
+| `Ctrl+K` | Command palette |
+| `Up` / `Down`, `Tab` / `Shift+Tab` | Move the palette selection |
+| `Enter` | Run the highlighted command / open the highlighted problem |
+| `Esc` | Close the palette |
+
+## CLI
+
+The same client works headlessly:
+
+```bash
+leetr list --limit 20 --slug          # browse
+leetr list --todo --search matrix     # filter (needs credentials)
+leetr show two-sum                    # statement as readable terminal text
+leetr show two-sum --raw              # raw statement HTML
+leetr languages                       # submission languages
+leetr whoami                          # verify the session
+leetr install-nvim-plugin             # install the nvim plugin
+```
 
 ## Editing: nvim interoperability
 
-Leetr treats a **file on disk as the source of truth**, so your editor and the app are
-never out of sync:
+**A file on disk is the source of truth.**
 
 ```
 ~/.local/share/leetr/workspace/<id>-<slug>/
     solution.py     # both Leetr and nvim edit this
     problem.md      # the statement, readable offline
-    meta.json       # ids/title/language
+    meta.json       # ids / title / language
 ```
 
-* Saving in nvim updates Leetr (the app notices the file change and reloads).
+* Opening a problem creates the directory and seeds the solution from LeetCode's
+  **boilerplate** for your configured language. An existing file is never overwritten.
+* Saving in nvim updates Leetr: the app notices the file change and reloads.
 * Editing in Leetr writes the file back, so `:e!` / `:LeetrPull` picks it up.
-* **Open in nvim** in the Code tab launches your editor on the file — inside tmux it opens
-  a split; otherwise it uses `$TERMINAL`; otherwise plain `nvim`. Configure
-  `editor_command` in `config.toml` to override.
-
-### Control API
-
-The app hosts a small API on `127.0.0.1:9527` (configurable), used by the bundled plugin
-and by anything else you want to script:
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | liveness + version |
-| `GET` | `/state` | open problem, language, file, code, solved flag |
-| `GET` | `/code` | the current buffer as text |
-| `POST` | `/code` | replace the current buffer |
-| `POST` | `/open` | open a problem by slug |
-| `POST` | `/run` | run the sample tests |
-| `POST` | `/submit` | submit the current buffer (respects the solved-guard) |
-
-`GET /state` also reports the latest judge result under `judge`.
-
-```bash
-curl -s 127.0.0.1:9527/state
-curl -sS -X POST -H 'Content-Type: application/json' \
-     -d '{"slug":"two-sum"}' 127.0.0.1:9527/open
-```
+* **Open in nvim** launches your editor on the file. Inside tmux it opens a split,
+  otherwise it uses `$TERMINAL`, otherwise plain `nvim`. Override with `editor_command`
+  in `config.toml`.
 
 ### nvim plugin
 
 ```bash
-leetr install-nvim-plugin     # writes ~/.config/nvim/lua/leetr.lua
+leetr install-nvim-plugin        # writes ~/.config/nvim/lua/leetr.lua
 ```
 
-Then add `require("leetr").setup()` to your nvim config. Commands:
+Then add `require("leetr").setup()` to your nvim config.
 
-| nvim command | Effect |
+| Command | Effect |
 | --- | --- |
-| `:LeetrStatus` | show what Leetr has open |
+| `:LeetrStatus` | show what Leetr has open, plus the last verdict |
 | `:LeetrOpen <slug>` | ask Leetr to open a problem |
 | `:LeetrPull` | load Leetr's buffer into this window |
 | `:LeetrPush` | send this buffer to Leetr |
@@ -200,9 +138,100 @@ Then add `require("leetr").setup()` to your nvim config. Commands:
 | `:LeetrResult` | show the last judge verdict |
 | `:LeetrPort <n>` | point the plugin at another port |
 
-Saving a file matching `*/solution.*` pushes it automatically, so the normal flow is just
-`leetr` + `nvim` side by side with no copying at all.
+Saving any `*/solution.*` file pushes it automatically, so the normal workflow is just
+Leetr and nvim side by side.
+
+### Control API
+
+Leetr hosts a small API on `127.0.0.1:9527` (configurable) — loopback only:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | liveness + version |
+| `GET` | `/state` | problem, language, file, code, solved flag, judge result |
+| `GET` | `/code` | current buffer as text |
+| `POST` | `/code` | replace the current buffer |
+| `POST` | `/open` | open a problem by slug |
+| `POST` | `/run` | run the sample tests |
+| `POST` | `/submit` | submit the buffer (respects the solved-guard) |
+
+Reads are served from a snapshot the UI publishes, so they never block. Writes are queued
+and applied on the next frame — and they *wake* the UI, so an idle window still reacts.
+
+## Safety rail
+
+Leetr refuses to submit to a problem that is **not already marked solved** on your account,
+and the refusal happens *before* any request reaches LeetCode — an attempt can never be
+spent accidentally:
+
+```
+refusing to submit to `median-of-two-sorted-arrays`: it is not in your solved set.
+Leetr only submits to problems you have already solved —
+set `allow_unsolved_submit = true` in config.toml to override.
+```
+
+The Submit button is disabled for unsolved problems too, and if the solved set has not
+loaded yet Leetr refuses rather than guessing. Set `allow_unsolved_submit = true` in
+`config.toml` to turn the guard off.
+
+## Architecture
+
+```
+src/
+  app.rs           eframe App: state, panels, background work
+  bg.rs            threads + channel plumbing (no async runtime)
+  config.rs        config.toml + credentials.toml
+  theme.rs         dark/light palettes, difficulty colours
+  glyphs.rs        every UI symbol, with a test that they exist in the default fonts
+  editor.rs        workspaces, per-language extensions, buffers, mtime reloading
+  nvim.rs          editor launch strategy + embedded nvim plugin + installer
+  interop.rs       loopback control API (tiny_http)
+  model.rs         domain types, decoupled from the API schema
+  leetcode/
+    graphql.rs     query strings + wire types
+    client.rs      blocking HTTP, auth, problem list, solved set
+    html.rs        statement HTML -> rich-text blocks
+    submit.rs      judge protocol, verdicts, solved-guard
+  ui/
+    problem_list.rs  virtualised list, filters
+    statement.rs     statement rendering
+    code_editor.rs   editor pane + verdict panel
+    palette.rs       fuzzy matching + Ctrl+K / Ctrl+P
+    status_bar.rs
+tests/live_api.rs  live integration tests (ignored by default)
+contrib/nvim/      the nvim plugin, embedded into the binary
+```
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test                       # 170+ unit tests, offline
+cargo test --test live_api -- --ignored   # hits the real LeetCode API
+```
+
+CI runs fmt, clippy (denied warnings) and the test suite on every push and PR.
+
+The live tests cover paging, search, statement fetching, the language list, the
+authenticated solved-set lookup, and headless rendering of the real statement and problem
+list panes. The judge client is tested against a mock judge over real HTTP (headers, CSRF,
+referer, bodies, polling) **plus fixtures copied verbatim from live responses** — an
+earlier hand-written fixture missed that `code_output` is an array for sample runs, which
+only the real API caught.
+
+## Notes and limitations
+
+* **No Monaco / embedded browser.** The original idea was a Monaco editor, but an embedded
+  WebKit/Chromium is ~50MB+ of runtime dependencies and fights "lightweight". The file +
+  nvim + control API design gives the same "edit in a real editor, submit from here"
+  workflow with none of the weight.
+* Problem pages load lazily; the palette searches what is loaded, then falls back to a
+  server-side search.
+* The judge is polled every 700ms for up to 30s.
+* Verified on Linux (X11 and Wayland). The macOS/Windows launch paths are implemented but
+  untested.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
