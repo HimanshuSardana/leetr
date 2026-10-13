@@ -157,3 +157,49 @@ fn authenticated_session_can_read_the_solved_set() {
         .expect("solved page");
     assert!(solved_page.total as usize == solved.len());
 }
+
+/// Drives the real statement pane with real content, headlessly.
+#[test]
+#[ignore = "hits the live LeetCode API"]
+fn statement_pane_renders_real_content() {
+    let detail = public_client().fetch_question("two-sum").expect("two-sum");
+    let blocks = html::parse(&detail.content_html);
+    assert!(
+        blocks.len() > 5,
+        "expected a rich statement, got {} blocks",
+        blocks.len()
+    );
+
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        leetr::ui::statement::show(ui, Some(&detail), &blocks, false, None);
+    });
+    output.textures_delta.clear();
+}
+
+/// Drives the real problem-list pane against a page of live problems.
+#[test]
+#[ignore = "hits the live LeetCode API"]
+fn problem_list_pane_renders_real_content() {
+    let page = public_client()
+        .fetch_problems(&ProblemQuery::new(25))
+        .expect("problem list");
+    let mut state = leetr::ui::problem_list::ProblemListState::default();
+
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        let _ = leetr::ui::problem_list::show(
+            ui,
+            &mut state,
+            &page.problems,
+            page.total,
+            false,
+            None,
+            true,
+            Some(page.problems[0].slug.as_str()),
+        );
+    });
+    output.textures_delta.clear();
+
+    assert_eq!(state.matching(&page.problems).len(), page.problems.len());
+}

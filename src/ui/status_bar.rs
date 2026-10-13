@@ -1,25 +1,52 @@
 //! Bottom status bar: auth badge + transient status message.
 
-use crate::config::{Config, Credentials};
+use crate::config::Config;
+use crate::glyphs;
 use crate::theme;
+
+/// What to show for the LeetCode session.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AuthBadge {
+    /// Credentials are configured and LeetCode accepted them.
+    SignedIn { username: String, solved: usize },
+    /// Either no credentials, or they have not been verified yet.
+    #[default]
+    BrowseOnly,
+}
 
 pub fn show(
     ui: &mut egui::Ui,
     config: &Config,
-    credentials: &Credentials,
+    auth: &AuthBadge,
     status: &str,
     error: Option<&str>,
 ) {
     ui.add_space(2.0);
     ui.horizontal(|ui| {
-        if credentials.is_configured() {
-            ui.label(egui::RichText::new("● signed in").color(theme::SUCCESS));
-        } else {
-            ui.label(egui::RichText::new("● browse-only").color(theme::WARNING))
+        match auth {
+            AuthBadge::SignedIn { username, solved } => {
+                ui.label(
+                    egui::RichText::new(format!("{} signed in", glyphs::DOT)).color(theme::SUCCESS),
+                );
+                if !username.is_empty() {
+                    ui.label(egui::RichText::new(username).weak().small());
+                }
+                ui.label(
+                    egui::RichText::new(format!("{solved} solved"))
+                        .weak()
+                        .small(),
+                );
+            }
+            AuthBadge::BrowseOnly => {
+                ui.label(
+                    egui::RichText::new(format!("{} browse-only", glyphs::DOT))
+                        .color(theme::WARNING),
+                )
                 .on_hover_text(
                     "No credentials found. Add them to ~/.config/leetr/credentials.toml \
-                     to run tests and submit solutions.",
+                         to run tests and submit solutions.",
                 );
+            }
         }
 
         ui.separator();
