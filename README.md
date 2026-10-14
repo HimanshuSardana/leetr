@@ -15,6 +15,18 @@ $ ldd target/release/leetr | wc -l
 5
 ```
 
+Measured rather than asserted, on a 1260×1052 window:
+
+| metric | Leetr | blank `eframe` window (same renderer) |
+| --- | --- | --- |
+| launch → answering on the control API | **0.12 s** | — |
+| proportional set size (PSS) | 54 MB | 49 MB |
+| resident set size (RSS) | 166 MB | 160 MB |
+
+So Leetr's own footprint is about **5 MB** on top of the toolkit floor. Plain RSS reads ~165 MB
+because it counts shared driver pages that every GL process maps — PSS is the honest number, and
+the difference is the GPU stack rather than this program.
+
 ---
 
 ## Features
