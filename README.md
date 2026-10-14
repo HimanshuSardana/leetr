@@ -259,7 +259,12 @@ exercised against the real judge without spending an attempt. That is what surfa
   workflow with none of the weight.
 * Problem pages load lazily; the palette searches what is loaded, then falls back to a
   server-side search.
-* The judge is polled every 700ms for up to 30s.
+* The judge is polled every 700ms for up to 30s, with a short retry on the rate limiting
+  LeetCode applies when you press Run several times quickly.
+* **Statement images are referenced, not rendered** — fetching and decoding them would mean an
+  image loader and a decoder, which this app deliberately avoids. The URL is shown so a diagram
+  is never silently missing (several problems, e.g. `add-two-numbers`, carry one the prose
+  refers to).
 * Verified on Linux (X11 and Wayland). The macOS/Windows launch paths are implemented but
   untested.
 

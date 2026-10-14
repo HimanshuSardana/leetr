@@ -153,12 +153,27 @@ fn render_block(ui: &mut Ui, block: &Block) {
             ui.add_space(3.0);
         }
         Block::ListItem(spans) => {
+            // The marker ("• " or "3. ") is carried in the spans.
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(glyphs::BULLET).weak());
+                ui.add_space(8.0);
                 ui.label(inline_job(spans, BODY_SIZE, ui));
             });
         }
         Block::Code(code) => code_block(ui, code),
+        Block::Image { alt, url } => {
+            // Deliberately not fetched — that would mean an image decoder and
+            // an HTTP loader. But it must be visible: several statements carry
+            // a diagram the prose refers to.
+            let label = if alt.trim().is_empty() {
+                format!("{} image", glyphs::BULLET)
+            } else {
+                format!("{} image: {}", glyphs::BULLET, alt.trim())
+            };
+            ui.label(RichText::new(label).weak().italics().small())
+                .on_hover_text(url.as_str());
+            ui.label(RichText::new(url.as_str()).weak().small().monospace());
+            ui.add_space(4.0);
+        }
         Block::Rule => {
             ui.add_space(2.0);
             ui.separator();
