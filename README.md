@@ -261,6 +261,11 @@ exercised against the real judge without spending an attempt. That is what surfa
   server-side search.
 * The judge is polled every 700ms for up to 30s, with a short retry on the rate limiting
   LeetCode applies when you press Run several times quickly.
+* **Link targets are dropped, their text is kept.** Measured before deciding: 44 problems
+  contained 5 `<a href>`s between them, all incidental references to Wikipedia or cplusplus.com
+  whose link text already carries the meaning ("in-place", "Run-length encoding"). Carrying a URL
+  on every inline span would touch the whole rendering path for almost no reader benefit, so this
+  is a deliberate "no" rather than an oversight.
 * **Statement images are referenced, not rendered** — fetching and decoding them would mean an
   image loader and a decoder, which this app deliberately avoids. The URL is shown so a diagram
   is never silently missing (several problems, e.g. `add-two-numbers`, carry one the prose
