@@ -611,6 +611,50 @@ mod tests {
         assert!(judge.is_submission);
     }
 
+    /// The nvim plugin is the real client, and it may fire several requests in
+    /// a row. Nothing should serialise in a way that loses or delays them.
+    #[test]
+    fn concurrent_requests_are_all_served() {
+        let (server, _) = server();
+        let port = server.port();
+
+        let handles: Vec<_> = (0..24)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let path = if i % 4 == 0 { "/state" } else { "/health" };
+                    request(port, "GET", path, None).0
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert_eq!(handle.join().expect("thread"), 200);
+        }
+    }
+
+    /// A client that connects and then stalls mid-request must not take the
+    /// whole API down with it: the server handles requests inline, so a
+    /// blocking read there would freeze every later request, and nvim commands
+    /// would simply stop responding.
+    #[test]
+    fn a_stalled_client_does_not_block_others() {
+        let (server, _) = server();
+        let port = server.port();
+
+        let mut stalled = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stalled
+            .write_all(b"POST /code HTTP/1.1\r\nHost: x\r\nContent-Length: 200\r\n\r\n{\"co")
+            .expect("write partial request");
+        stalled.flush().unwrap();
+
+        // If this blocks, the request helper's 5s read timeout trips and the
+        // assertion below fails rather than hanging forever.
+        let (status, body) = request(port, "GET", "/health", None);
+        assert_eq!(status, 200, "a stalled client blocked the server: {body}");
+
+        drop(stalled);
+    }
+
     #[test]
     fn malformed_json_is_rejected() {
         let (server, shared) = server();
