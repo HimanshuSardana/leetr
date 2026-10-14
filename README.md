@@ -97,7 +97,22 @@ While a palette is open it takes the keyboard instead:
 | `Esc` | Close the palette |
 
 `Tab` switches panes on the main view but moves the selection inside a palette,
-so it never does both at once.
+so it never does both at once. While the **problem filter** has focus, `Tab` is
+left to the field instead, so typing a query and then pressing Tab does not yank
+you into the code pane. (Fixing that was its own commit: it used to change 31,699
+pixels of the view mid-query.)
+
+### Deliberate shortcut overrides
+
+The global shortcuts are checked before any widget sees the key, so a few of them
+shadow a built-in text-editing binding. That is a choice, not an oversight:
+
+* `Ctrl+K` — egui's text fields bind this to "delete to end of line". Leetr claims
+  it for the command palette, which is the usual convention for a global palette
+  and is far more useful here than kill-line in a single-line filter box.
+* Everything else is free: egui's text fields only bind `Ctrl+H`, `Ctrl+K`,
+  `Ctrl+U` and `Ctrl+W`, so `Ctrl+P`, `Ctrl+O`, `Ctrl+'`, `Ctrl+Enter`, `Ctrl+B`
+  and `Tab` shadow nothing.
 
 ## CLI
 
