@@ -1177,6 +1177,46 @@ mod tests {
         );
     }
 
+    /// The 429 retry must not fire on a transport failure, or a dead network
+    /// would take four backoffs (~18s) to report instead of failing at once.
+    #[test]
+    fn a_transport_failure_fails_fast_and_does_not_retry() {
+        let client = LeetCodeClient::with_base_url(
+            Credentials {
+                leetcode_session: "s".into(),
+                csrftoken: "t".into(),
+            },
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let error = client
+            .run_sample("two-sum", "1", "python3", "code", "input")
+            .unwrap_err()
+            .to_string();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must fail fast rather than run the rate-limit backoff; took {elapsed:?}"
+        );
+        assert!(
+            error.contains("127.0.0.1:1"),
+            "should name the endpoint: {error}"
+        );
+
+        let started = Instant::now();
+        assert!(client
+            .submit_solution("two-sum", "1", "python3", "code")
+            .is_err());
+        assert!(client.check_submission("123").is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "check_submission must fail fast too"
+        );
+    }
+
     #[test]
     fn submitting_sends_the_large_judge_and_returns_the_id() {
         let judge = mock::MockJudge::start();

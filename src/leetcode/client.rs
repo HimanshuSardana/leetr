@@ -435,6 +435,34 @@ mod tests {
         assert_eq!(truncate("abcdef", 3), "abc…");
     }
 
+    /// A closed port: nothing listens there, so the request fails at the
+    /// transport layer. This is the "no network" path, which the GUI shows in
+    /// red, and it must produce a usable message rather than a panic or a hang.
+    #[test]
+    fn a_transport_failure_surfaces_a_usable_error() {
+        let client =
+            LeetCodeClient::with_base_url(Credentials::default(), "http://127.0.0.1:1").unwrap();
+
+        let error = client
+            .fetch_problems(&ProblemQuery::new(1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("127.0.0.1:1"),
+            "should name the endpoint: {error}"
+        );
+        assert!(
+            error.to_lowercase().contains("network") || error.to_lowercase().contains("connect"),
+            "should hint at connectivity: {error}"
+        );
+
+        // The other entry points must fail the same way rather than panicking.
+        assert!(client.fetch_question("two-sum").is_err());
+        assert!(client.fetch_languages().is_err());
+        assert!(client.fetch_user_status().is_err());
+        assert!(client.fetch_solved_slugs().is_err());
+    }
+
     #[test]
     fn wire_problem_conversion_maps_status_and_tags() {
         let wire: g::WireProblem = serde_json::from_str(
