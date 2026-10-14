@@ -1,5 +1,7 @@
 # Leetr
 
+**NOTE:** This is purely vibe-coded slop I made to benchmark *DeepSeek V4.1 Flash*, stuff may (and will) break
+
 A **lightweight** desktop LeetCode client in Rust with [`egui`](https://github.com/emilk/egui)
 — and first-class **nvim interoperability** so you never copy-paste between your editor and
 a browser again.
