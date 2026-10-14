@@ -384,6 +384,12 @@ vim.cmd("q")"#;
 
     #[test]
     fn install_hint_lists_every_command_and_the_setup_line() {
+        // Otherwise an empty PLUGIN_COMMANDS makes this loop vacuous.
+        assert!(
+            !PLUGIN_COMMANDS.is_empty(),
+            "PLUGIN_COMMANDS is empty — the loop would assert nothing"
+        );
+
         let hint = install_hint();
         assert!(hint.contains(setup_snippet()));
         for (name, _) in PLUGIN_COMMANDS {
