@@ -70,6 +70,14 @@ pub enum Block {
     ListItem(Vec<Span>),
     /// A `<pre>` block — monospace, whitespace preserved.
     Code(String),
+    /// An `<img>`. The picture itself is not fetched (that would mean an image
+    /// decoder and an HTTP loader, which this app deliberately avoids) but the
+    /// statement must not *silently* lose it — several problems carry a diagram
+    /// the prose refers to.
+    Image {
+        alt: String,
+        url: String,
+    },
     Rule,
 }
 
@@ -90,8 +98,16 @@ pub fn to_plain_text(blocks: &[Block]) -> String {
 fn render_block(block: &Block) -> String {
     match block {
         Block::Paragraph(spans) | Block::Heading(spans) => spans_text(spans),
-        Block::ListItem(spans) => format!("  • {}", spans_text(spans)),
+        // The marker ("• " or "3. ") is already part of the spans.
+        Block::ListItem(spans) => format!("  {}", spans_text(spans)),
         Block::Code(code) => code.trim_end().to_string(),
+        Block::Image { alt, url } => {
+            if alt.trim().is_empty() {
+                format!("[image] {url}")
+            } else {
+                format!("[image: {}] {url}", alt.trim())
+            }
+        }
         Block::Rule => "────────────────────────".to_string(),
     }
 }
@@ -108,6 +124,8 @@ fn spans_text(spans: &[Span]) -> String {
 enum Token {
     Tag {
         name: String,
+        /// The rest of the tag, so `<img src=… alt=…>` can be read.
+        attrs: String,
         closing: bool,
         self_closing: bool,
     },
@@ -166,8 +184,10 @@ fn push_tag(tokens: &mut Vec<Token>, raw: &str) {
         return;
     }
 
+    let attrs = body[name.len()..].to_string();
     tokens.push(Token::Tag {
         name,
+        attrs,
         closing,
         self_closing: raw.ends_with('/'),
     });
@@ -209,6 +229,8 @@ struct Parser {
     pre: String,
     /// Nesting depth of `<ul>`/`<ol>`; `> 0` makes lines list items.
     list_depth: usize,
+    /// For each open list, whether it is ordered and the next item number.
+    lists: Vec<Option<usize>>,
 }
 
 impl Parser {
@@ -222,13 +244,14 @@ impl Parser {
                 Token::Text(text) => self.text(&text),
                 Token::Tag {
                     name,
+                    attrs,
                     closing,
                     self_closing,
                 } => {
                     if closing {
                         self.close_tag(&name);
                     } else {
-                        self.open_tag(&name, self_closing);
+                        self.open_tag_with_attrs(&name, &attrs, self_closing);
                     }
                 }
             }
@@ -260,6 +283,21 @@ impl Parser {
         self.line.push(Span::new(collapsed, self.style));
     }
 
+    fn open_tag_with_attrs(&mut self, tag: &str, attrs: &str, self_closing: bool) {
+        if tag == "img" {
+            // Keep the diagram visible as a reference rather than dropping it.
+            if let Some(url) = attribute(attrs, "src") {
+                self.flush();
+                self.blocks.push(Block::Image {
+                    alt: attribute(attrs, "alt").unwrap_or_default(),
+                    url,
+                });
+            }
+            return;
+        }
+        self.open_tag(tag, self_closing);
+    }
+
     fn open_tag(&mut self, tag: &str, self_closing: bool) {
         match tag {
             "pre" => {
@@ -284,10 +322,21 @@ impl Parser {
             "ul" | "ol" => {
                 self.flush();
                 self.list_depth += 1;
+                // `Some(n)` means ordered, with `n` the next item number.
+                self.lists.push(if tag == "ol" { Some(1) } else { None });
                 return;
             }
             "li" => {
                 self.flush();
+                let marker = match self.lists.last_mut() {
+                    Some(Some(next)) => {
+                        let marker = format!("{next}. ");
+                        *next += 1;
+                        marker
+                    }
+                    _ => "• ".to_string(),
+                };
+                self.line.push(Span::new(marker, SpanStyle::Normal));
                 return;
             }
             "td" | "th" => {
@@ -341,6 +390,7 @@ impl Parser {
             "ul" | "ol" => {
                 self.flush();
                 self.list_depth = self.list_depth.saturating_sub(1);
+                self.lists.pop();
                 return;
             }
             "li" | "tr" => {
@@ -386,6 +436,26 @@ impl Parser {
             self.blocks.push(Block::Paragraph(spans));
         }
     }
+}
+
+/// Read `name="value"` (or `name='value'`) out of a tag's attribute text.
+fn attribute(attrs: &str, name: &str) -> Option<String> {
+    let mut rest = attrs;
+    while let Some(index) = rest.find(name) {
+        let after = &rest[index + name.len()..];
+        // Must be followed by `=` (with optional space) to be this attribute.
+        let after = after.trim_start();
+        if let Some(value) = after.strip_prefix('=') {
+            let value = value.trim_start();
+            let quote = value.chars().next()?;
+            if quote == '"' || quote == '\'' {
+                let inner = &value[quote.len_utf8()..];
+                return inner.find(quote).map(|end| inner[..end].to_string());
+            }
+        }
+        rest = after;
+    }
+    None
 }
 
 fn is_emphasis_container(tag: &str) -> bool {
@@ -505,6 +575,78 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert!(matches!(blocks[0], Block::ListItem(_)));
         assert_eq!(text_of(&blocks), "  • one\n  • two");
+    }
+
+    #[test]
+    fn images_are_kept_as_a_reference_not_dropped() {
+        let html = r#"<p>See the diagram:</p><img alt="linked list" src="https://assets.leetcode.com/x.jpg" style="width:1px" /><p>after</p>"#;
+        let blocks = parse(html);
+        let image = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Image { alt, url } => Some((alt.clone(), url.clone())),
+                _ => None,
+            })
+            .expect("the image must survive parsing");
+        assert_eq!(image.0, "linked list");
+        assert_eq!(image.1, "https://assets.leetcode.com/x.jpg");
+
+        let text = to_plain_text(&blocks);
+        assert!(text.contains("[image: linked list] https://assets.leetcode.com/x.jpg"));
+        assert!(
+            text.contains("See the diagram:"),
+            "surrounding text is kept"
+        );
+        assert!(text.contains("after"));
+    }
+
+    #[test]
+    fn an_image_without_a_src_is_ignored() {
+        let blocks = parse(r#"<p>a</p><img alt="decorative" /><p>b</p>"#);
+        assert!(!blocks.iter().any(|b| matches!(b, Block::Image { .. })));
+        assert!(to_plain_text(&blocks).contains('a'));
+    }
+
+    #[test]
+    fn an_image_without_alt_still_reports_its_url() {
+        // Real markup: add-two-numbers ships `<img alt="" src="…">`.
+        let blocks = parse(r#"<img alt="" src="https://assets.leetcode.com/addtwonumber1.jpg" />"#);
+        let text = to_plain_text(&blocks);
+        assert!(
+            text.contains("[image] https://assets.leetcode.com/addtwonumber1.jpg"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn ordered_lists_keep_their_numbers() {
+        let blocks = parse("<ol><li>first</li><li>second</li><li>third</li></ol>");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(text_of(&blocks), "  1. first\n  2. second\n  3. third");
+    }
+
+    #[test]
+    fn a_nested_ordered_list_after_a_bullet_list_still_numbers() {
+        let html = "<ul><li>bullet</li></ul><ol><li>one</li><li>two</li></ol>";
+        assert_eq!(text_of(&parse(html)), "  • bullet\n  1. one\n  2. two");
+    }
+
+    #[test]
+    fn attribute_reading_handles_quotes_and_spacing() {
+        assert_eq!(
+            attribute(r#" src="a.jpg" alt="x""#, "src").as_deref(),
+            Some("a.jpg")
+        );
+        assert_eq!(
+            attribute(r#" alt='single' src=bare"#, "alt").as_deref(),
+            Some("single")
+        );
+        // `srcset` must not be mistaken for `src`.
+        assert_eq!(
+            attribute(r#" srcset="a,b" src="c.jpg""#, "src").as_deref(),
+            Some("c.jpg")
+        );
+        assert_eq!(attribute(r#" alt="only an alt""#, "src"), None);
     }
 
     #[test]

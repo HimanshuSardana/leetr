@@ -329,3 +329,56 @@ fn sample_run_reports_wrong_answer_for_wrong_code() {
     );
     assert_eq!(result.expected_text().as_deref(), Some("[0,1]"));
 }
+
+#[test]
+#[ignore = "hits the live LeetCode API"]
+fn statements_across_problems_render_without_leaking_markup() {
+    // The parser was written against `two-sum`'s markup, but real statements
+    // vary: `<img>` diagrams, `<ol>`, `<sub>`, `<a>`, `<font>`. Parsing several
+    // structurally different problems is the only way to know the parser copes
+    // — a fixture would just encode my own assumptions again.
+    let client = public_client();
+    let slugs = [
+        "two-sum",              // the original baseline
+        "add-two-numbers",      // contains an <img> diagram
+        "valid-sudoku",         // contains an <ol>
+        "word-ladder",          // contains <sub>
+        "merge-k-sorted-lists", // heavy on <pre> examples
+        "lru-cache",            // contains <a> links
+    ];
+
+    let mut with_image = 0;
+    for slug in slugs {
+        let detail = client.fetch_question(slug).expect("statement");
+        let blocks = html::parse(&detail.content_html);
+        let text = html::to_plain_text(&blocks);
+
+        assert!(!blocks.is_empty(), "{slug}: parsed to nothing");
+        assert!(
+            text.len() > 200,
+            "{slug}: suspiciously little text ({} bytes)",
+            text.len()
+        );
+        for leak in ["<p>", "</", "&lt;", "&nbsp;", "&quot;", "&#"] {
+            assert!(
+                !text.contains(leak),
+                "{slug}: `{leak}` leaked into the output"
+            );
+        }
+
+        if text.contains("[image]") || text.contains("[image:") {
+            with_image += 1;
+            eprintln!("{slug}: image reference preserved");
+        }
+        eprintln!(
+            "{slug}: {} blocks, {} bytes of text",
+            blocks.len(),
+            text.len()
+        );
+    }
+
+    assert!(
+        with_image > 0,
+        "at least one of these problems has an <img>; it must not vanish silently"
+    );
+}
