@@ -185,12 +185,18 @@ fn problem_list_pane_renders_real_content() {
         .fetch_problems(&ProblemQuery::new(25))
         .expect("problem list");
     let mut state = leetr::ui::problem_list::ProblemListState::default();
+    let header = leetr::ui::problem_list::Header {
+        session: "browse-only",
+        session_color: None,
+        theme: leetr::theme::Theme::Dark,
+    };
 
     let ctx = egui::Context::default();
     let mut output = ctx.run_ui(Default::default(), |ui| {
         let _ = leetr::ui::problem_list::show(
             ui,
             &mut state,
+            &header,
             &page.problems,
             page.total,
             false,

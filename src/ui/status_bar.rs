@@ -26,6 +26,7 @@ pub fn show(
     auth: &AuthBadge,
     status: &str,
     error: Option<&str>,
+    api_port: u16,
 ) {
     ui.add_space(2.0);
     ui.horizontal(|ui| {
@@ -84,7 +85,7 @@ pub fn show(
                     "{} · lang {} · api :{}",
                     config.theme.label(),
                     config.default_language,
-                    config.interop_port
+                    api_port
                 ))
                 .weak()
                 .small(),

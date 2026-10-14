@@ -3,17 +3,29 @@
 //!
 //! The matching logic is a pure function so it can be tested exhaustively
 //! without an egui context.
+//!
+//! Visually it follows the "spotlight" convention: a borderless search field
+//! with a key cap on the right, a row of filter chips, small-caps section
+//! headers, and rows whose trailing edge carries either a shortcut key cap or a
+//! muted hint.
 
-use egui::{Color32, Key, RichText, TextEdit};
+use egui::{
+    Align2, Color32, CornerRadius, FontId, Key, Margin, RichText, Sense, Stroke, StrokeKind,
+    TextEdit,
+};
+
+use crate::glyphs;
 
 /// Width of the palette popup.
-const PALETTE_WIDTH: f32 = 680.0;
+const PALETTE_WIDTH: f32 = 660.0;
 /// Height of the scrollable result list.
-const LIST_HEIGHT: f32 = 400.0;
+const LIST_HEIGHT: f32 = 380.0;
 /// Upper bound on rendered rows, so a 4000-entry list stays instant.
 const MAX_ROWS: usize = 200;
 /// Height of one result row.
 const ROW_HEIGHT: f32 = 40.0;
+/// Height of a key cap / shortcut badge.
+const CAP_HEIGHT: f32 = 20.0;
 
 // ---------------------------------------------------------------------------
 // Fuzzy matching
@@ -112,21 +124,27 @@ pub fn rank<S: AsRef<str>>(query: &str, candidates: &[S]) -> Vec<usize> {
 // ---------------------------------------------------------------------------
 
 /// One selectable row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaletteEntry {
     pub label: String,
     /// Secondary text shown after the label (and searched too).
     pub hint: String,
     /// Optional glyph, drawn with the monospace font (see [`crate::glyphs`]).
     pub icon: Option<String>,
+    /// Group heading this row sits under. Consecutive rows sharing a section
+    /// are drawn beneath one small-caps header.
+    pub section: Option<String>,
+    /// Keyboard shortcut, drawn as a key cap on the right of the row.
+    pub shortcut: Option<String>,
+    /// Chip ids this row answers to (used by the filter chips).
+    pub tags: Vec<String>,
 }
 
 impl PaletteEntry {
     pub fn new(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
-            hint: String::new(),
-            icon: None,
+            ..Self::default()
         }
     }
 
@@ -140,6 +158,25 @@ impl PaletteEntry {
         self
     }
 
+    pub fn with_section(mut self, section: impl Into<String>) -> Self {
+        self.section = Some(section.into());
+        self
+    }
+
+    pub fn with_shortcut(mut self, shortcut: impl Into<String>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
+    }
+
+    pub fn with_tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags = tags.into_iter().map(Into::into).collect();
+        self
+    }
+
     fn search_text(&self) -> String {
         if self.hint.is_empty() {
             self.label.clone()
@@ -149,12 +186,45 @@ impl PaletteEntry {
     }
 }
 
+/// A filter chip drawn above the results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteChip {
+    pub id: String,
+    pub label: String,
+}
+
+impl PaletteChip {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// Everything the palette needs besides the entries themselves.
+#[derive(Debug, Clone, Default)]
+pub struct PaletteConfig<'a> {
+    /// Stable id (keeps the modal and its widgets apart per palette).
+    pub id: &'a str,
+    /// Placeholder shown in the empty search field.
+    pub placeholder: &'a str,
+    /// Key cap drawn at the right of the search field, e.g. `"Ctrl P"`.
+    pub search_badge: Option<&'a str>,
+    /// Filter chips shown between the search field and the results.
+    pub chips: Vec<PaletteChip>,
+    /// Fallback action offered when nothing matches (see `empty_action`).
+    pub empty_action: Option<&'a str>,
+}
+
 /// Open/closed state and cursor of one palette.
 #[derive(Debug, Default, Clone)]
 pub struct PaletteState {
     open: bool,
     query: String,
     selected: usize,
+    /// Active filter chip id; `None` means "All".
+    chip: Option<String>,
     /// Set for one frame after opening so the text field takes focus.
     grab_focus: bool,
     /// Set when the selection moved by keyboard so the list scrolls to it.
@@ -166,11 +236,12 @@ impl PaletteState {
         self.open
     }
 
-    /// Open with a clean query.
+    /// Open with a clean query and no chip filter.
     pub fn open(&mut self) {
         self.open = true;
         self.query.clear();
         self.selected = 0;
+        self.chip = None;
         self.grab_focus = true;
         self.scroll_to_selection = false;
     }
@@ -179,12 +250,18 @@ impl PaletteState {
         self.open = false;
         self.query.clear();
         self.selected = 0;
+        self.chip = None;
         self.grab_focus = false;
         self.scroll_to_selection = false;
     }
 
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// The active chip id, if any.
+    pub fn active_chip(&self) -> Option<&str> {
+        self.chip.as_deref()
     }
 }
 
@@ -202,21 +279,118 @@ pub struct PaletteOutcome {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// Colours that differ between the two themes.
+struct Colors {
+    border: Color32,
+    selection_fill: Color32,
+    hover_fill: Color32,
+    chip_fill: Color32,
+    chip_border: Color32,
+    chip_active_fill: Color32,
+    cap_fill: Color32,
+    cap_border: Color32,
+}
+
+fn colors(dark: bool) -> Colors {
+    if dark {
+        Colors {
+            border: Color32::from_rgb(0x2a, 0x2f, 0x37),
+            selection_fill: Color32::from_rgb(0x2a, 0x35, 0x49),
+            hover_fill: Color32::from_rgb(0x20, 0x25, 0x2c),
+            chip_fill: Color32::from_rgb(0x22, 0x26, 0x2c),
+            chip_border: Color32::from_rgb(0x33, 0x39, 0x42),
+            chip_active_fill: Color32::from_rgb(0x2a, 0x35, 0x49),
+            cap_fill: Color32::from_rgb(0x1c, 0x20, 0x26),
+            cap_border: Color32::from_rgb(0x39, 0x3f, 0x49),
+        }
+    } else {
+        Colors {
+            border: Color32::from_rgb(0xe6, 0xe8, 0xec),
+            selection_fill: Color32::from_rgb(0xe9, 0xef, 0xf9),
+            hover_fill: Color32::from_rgb(0xf2, 0xf4, 0xf7),
+            chip_fill: Color32::from_rgb(0xf3, 0xf4, 0xf7),
+            chip_border: Color32::from_rgb(0xdc, 0xdf, 0xe4),
+            chip_active_fill: Color32::from_rgb(0xe4, 0xec, 0xfa),
+            cap_fill: Color32::from_rgb(0xf1, 0xf2, 0xf5),
+            cap_border: Color32::from_rgb(0xd5, 0xd9, 0xdf),
+        }
+    }
+}
+
+/// Size a key cap needs to fit `text`.
+fn key_cap_size(ui: &egui::Ui, text: &str) -> egui::Vec2 {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        FontId::monospace(11.0),
+        Color32::PLACEHOLDER,
+    );
+    egui::vec2(galley.size().x + 16.0, CAP_HEIGHT)
+}
+
+/// Paint a bordered key cap.
+fn paint_key_cap(ui: &egui::Ui, rect: egui::Rect, text: &str, border: Color32, fill: Color32) {
+    let radius = CornerRadius::same(5);
+    ui.painter().rect_filled(rect, radius, fill);
+    ui.painter()
+        .rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::monospace(11.0),
+        ui.visuals().weak_text_color(),
+    );
+}
+
+/// Indices of `entries` visible for a query and chip filter.
+///
+/// Ranking is by [`rank`]. With an empty query the rows are a grouped browse
+/// view, so each section is kept together (in first-appearance order) while the
+/// order *within* a section is preserved. The returned indices always point at
+/// the original entries, so a choice maps straight back.
+fn visible_matches(query: &str, entries: &[PaletteEntry], chip: Option<&str>) -> Vec<usize> {
+    let texts: Vec<String> = entries.iter().map(PaletteEntry::search_text).collect();
+    let mut matches = rank(query, &texts);
+
+    if let Some(chip) = chip {
+        matches.retain(|&index| entries[index].tags.iter().any(|tag| tag == chip));
+    }
+
+    if query.trim().is_empty() {
+        let mut order: Vec<&str> = Vec::new();
+        for entry in entries {
+            if let Some(section) = entry.section.as_deref() {
+                if !order.contains(&section) {
+                    order.push(section);
+                }
+            }
+        }
+        matches.sort_by_key(|&index| {
+            let section = entries[index].section.as_deref().unwrap_or("");
+            order
+                .iter()
+                .position(|s| *s == section)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    matches
+}
+
 /// Draw the palette as a modal overlay. Returns the user's choice, if any.
 pub fn show(
     ctx: &egui::Context,
     state: &mut PaletteState,
-    id: &str,
-    placeholder: &str,
     entries: &[PaletteEntry],
-    empty_action: Option<&str>,
+    config: &PaletteConfig<'_>,
 ) -> PaletteOutcome {
     if !state.open {
         return PaletteOutcome::default();
     }
 
-    let texts: Vec<String> = entries.iter().map(PaletteEntry::search_text).collect();
-    let matches = rank(&state.query, &texts);
+    let grouped = state.query.trim().is_empty();
+    let matches = visible_matches(&state.query, entries, state.chip.as_deref());
+
     if state.selected >= matches.len() {
         state.selected = matches.len().saturating_sub(1);
     }
@@ -226,7 +400,7 @@ pub fn show(
         (screen.center().x - PALETTE_WIDTH / 2.0).max(screen.left() + 8.0),
         screen.top() + 76.0,
     );
-    let modal_id = egui::Id::new(("leetr-palette", id));
+    let modal_id = egui::Id::new(("leetr-palette", config.id));
 
     // Keyboard navigation is read before the widgets so a single key press
     // cannot both move the cursor and activate a row.
@@ -252,7 +426,7 @@ pub fn show(
     // egui popup.
     let popup_frame = egui::Frame::popup(ctx.global_style().as_ref())
         .corner_radius(egui::CornerRadius::same(14))
-        .inner_margin(egui::Margin::ZERO)
+        .inner_margin(Margin::ZERO)
         .shadow(egui::epaint::Shadow {
             offset: [0, 12],
             blur: 32,
@@ -267,49 +441,99 @@ pub fn show(
         .show(ctx, |ui| {
             let mut outcome = PaletteOutcome::default();
             let mut empty_action_clicked = false;
+            let mut requested_chip: Option<Option<String>> = None;
             ui.set_width(PALETTE_WIDTH);
 
-            let dark = ui.visuals().dark_mode;
-            let border = if dark {
-                Color32::from_rgb(0x2a, 0x2f, 0x37)
-            } else {
-                Color32::from_rgb(0xe6, 0xe8, 0xec)
-            };
-            let selection_fill = if dark {
-                Color32::from_rgb(0x2a, 0x35, 0x49)
-            } else {
-                Color32::from_rgb(0xe9, 0xef, 0xf9)
-            };
-            let hover_fill = if dark {
-                Color32::from_rgb(0x20, 0x25, 0x2c)
-            } else {
-                Color32::from_rgb(0xf2, 0xf4, 0xf7)
-            };
+            let palette_colors = colors(ui.visuals().dark_mode);
 
             // -- search -------------------------------------------------
             let search = egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(16, 14))
+                .inner_margin(Margin::symmetric(16, 13))
                 .show(ui, |ui| {
-                    let edit = ui.add(
-                        TextEdit::singleline(&mut state.query)
-                            .id(modal_id.with("query"))
-                            .hint_text(RichText::new(placeholder).size(15.0))
-                            .frame(egui::Frame::NONE)
-                            .font(egui::FontId::proportional(15.0))
-                            .desired_width(f32::INFINITY),
-                    );
-                    if std::mem::take(&mut state.grab_focus) {
-                        edit.request_focus();
-                    }
-                    if edit.changed() {
-                        state.selected = 0;
-                    }
+                    ui.horizontal(|ui| {
+                        let galley = ui.painter().layout_no_wrap(
+                            glyphs::SEARCH.to_owned(),
+                            FontId::monospace(14.0),
+                            ui.visuals().weak_text_color(),
+                        );
+                        let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+                        ui.painter()
+                            .galley(rect.min, galley, ui.visuals().weak_text_color());
+                        ui.add_space(10.0);
+
+                        // Size the field so the key cap still fits on the right.
+                        let cap_size = config.search_badge.map(|text| key_cap_size(ui, text));
+                        let reserved = cap_size.map_or(0.0, |size| size.x + 10.0);
+                        let edit_width = (ui.available_width() - reserved).max(80.0);
+                        let edit = ui.add(
+                            TextEdit::singleline(&mut state.query)
+                                .id(modal_id.with("query"))
+                                .hint_text(RichText::new(config.placeholder).size(15.0))
+                                .frame(egui::Frame::NONE)
+                                .margin(Margin::ZERO)
+                                .font(FontId::proportional(15.0))
+                                .desired_width(edit_width),
+                        );
+                        if std::mem::take(&mut state.grab_focus) {
+                            edit.request_focus();
+                        }
+                        if edit.changed() {
+                            state.selected = 0;
+                        }
+
+                        if let (Some(text), Some(size)) = (config.search_badge, cap_size) {
+                            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                            paint_key_cap(
+                                ui,
+                                rect,
+                                text,
+                                palette_colors.cap_border,
+                                palette_colors.cap_fill,
+                            );
+                        }
+                    });
                 });
             ui.painter().hline(
                 search.response.rect.x_range(),
                 search.response.rect.bottom(),
-                egui::Stroke::new(1.0, border),
+                Stroke::new(1.0, palette_colors.border),
             );
+
+            // -- chips --------------------------------------------------
+            if !config.chips.is_empty() {
+                let chips = egui::Frame::NONE
+                    .inner_margin(Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                            for chip in &config.chips {
+                                // The chip with id "all" means "no filter", so it
+                                // reads as active whenever no chip is selected.
+                                let active = state
+                                    .chip
+                                    .as_deref()
+                                    .map_or(chip.id == "all", |current| current == chip.id);
+                                if chip_button(ui, &chip.label, active, &palette_colors).clicked() {
+                                    requested_chip = Some(if active || chip.id == "all" {
+                                        None
+                                    } else {
+                                        Some(chip.id.clone())
+                                    });
+                                }
+                            }
+                        });
+                    });
+                ui.painter().hline(
+                    chips.response.rect.x_range(),
+                    chips.response.rect.bottom(),
+                    Stroke::new(1.0, palette_colors.border),
+                );
+            }
+
+            if let Some(next) = requested_chip {
+                state.chip = next;
+                state.selected = 0;
+            }
 
             // -- results ------------------------------------------------
             egui::ScrollArea::vertical()
@@ -320,7 +544,7 @@ pub fn show(
 
                     if matches.is_empty() {
                         ui.add_space(12.0);
-                        ui.vertical_centered(|ui| match empty_action {
+                        ui.vertical_centered(|ui| match config.empty_action {
                             Some(label) => {
                                 if ui
                                     .add(egui::Button::new(label).corner_radius(8.0))
@@ -337,8 +561,21 @@ pub fn show(
                         return;
                     }
 
+                    let mut last_section: Option<&str> = None;
                     for (row, &entry_index) in matches.iter().enumerate().take(MAX_ROWS) {
                         let entry = &entries[entry_index];
+
+                        if grouped {
+                            let section = entry.section.as_deref().unwrap_or("");
+                            if !section.is_empty() && last_section != Some(section) {
+                                if last_section.is_some() {
+                                    ui.add_space(8.0);
+                                }
+                                section_header(ui, section);
+                                last_section = Some(section);
+                            }
+                        }
+
                         let is_selected = row == state.selected;
                         let (rect, response) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), ROW_HEIGHT),
@@ -350,14 +587,14 @@ pub fn show(
                             if is_selected {
                                 ui.painter().rect_filled(
                                     pill,
-                                    egui::CornerRadius::same(8),
-                                    selection_fill,
+                                    CornerRadius::same(8),
+                                    palette_colors.selection_fill,
                                 );
                             } else if response.hovered() {
                                 ui.painter().rect_filled(
                                     pill,
-                                    egui::CornerRadius::same(8),
-                                    hover_fill,
+                                    CornerRadius::same(8),
+                                    palette_colors.hover_fill,
                                 );
                             }
 
@@ -369,8 +606,14 @@ pub fn show(
                             let hint_color = ui.visuals().weak_text_color();
                             let inner = rect.shrink2(egui::vec2(16.0, 0.0));
 
-                            let hint_font = egui::FontId::proportional(12.0);
-                            let hint_width = if entry.hint.is_empty() {
+                            // The trailing element is a shortcut key cap when the
+                            // row has one, otherwise the muted hint text.
+                            let hint_font = FontId::proportional(12.0);
+                            let cap_size =
+                                entry.shortcut.as_deref().map(|text| key_cap_size(ui, text));
+                            let hint_width = if let Some(size) = cap_size {
+                                size.x + 16.0
+                            } else if entry.hint.is_empty() {
                                 0.0
                             } else {
                                 ui.painter()
@@ -394,7 +637,7 @@ pub fn show(
                             if let Some(icon) = entry.icon.as_deref() {
                                 let galley = ui.painter().layout_no_wrap(
                                     icon.to_owned(),
-                                    egui::FontId::monospace(14.0),
+                                    FontId::monospace(14.0),
                                     text_color,
                                 );
                                 let position = egui::pos2(
@@ -407,7 +650,7 @@ pub fn show(
 
                             let label = ui.painter().layout(
                                 entry.label.clone(),
-                                egui::FontId::proportional(14.5),
+                                FontId::proportional(14.5),
                                 text_color,
                                 (inner.width() - hint_width - (label_left - inner.left()))
                                     .max(40.0),
@@ -418,10 +661,26 @@ pub fn show(
                                 text_color,
                             );
 
-                            if !entry.hint.is_empty() {
+                            if let (Some(text), Some(size)) = (entry.shortcut.as_deref(), cap_size)
+                            {
+                                let cap = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        inner.right() - size.x,
+                                        inner.center().y - size.y / 2.0,
+                                    ),
+                                    size,
+                                );
+                                paint_key_cap(
+                                    ui,
+                                    cap,
+                                    text,
+                                    palette_colors.cap_border,
+                                    palette_colors.cap_fill,
+                                );
+                            } else if !entry.hint.is_empty() {
                                 ui.painter().text(
                                     egui::pos2(inner.right(), inner.center().y),
-                                    egui::Align2::RIGHT_CENTER,
+                                    Align2::RIGHT_CENTER,
                                     &entry.hint,
                                     hint_font,
                                     hint_color,
@@ -447,13 +706,15 @@ pub fn show(
                     outcome.chosen = Some(entry_index);
                 }
             }
-            if empty_action_clicked || (activate && matches.is_empty() && empty_action.is_some()) {
+            if empty_action_clicked
+                || (activate && matches.is_empty() && config.empty_action.is_some())
+            {
                 outcome.empty_action = true;
             }
 
             // -- footer ------------------------------------------------
             let footer = egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(16, 10))
+                .inner_margin(Margin::symmetric(16, 10))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let hint = RichText::new("Up/Down navigate · Enter select · Esc close")
@@ -472,7 +733,7 @@ pub fn show(
             ui.painter().hline(
                 footer.response.rect.x_range(),
                 footer.response.rect.top(),
-                egui::Stroke::new(1.0, border),
+                Stroke::new(1.0, palette_colors.border),
             );
 
             outcome
@@ -489,6 +750,63 @@ pub fn show(
     outcome
 }
 
+/// One filter chip.
+fn chip_button(ui: &mut egui::Ui, label: &str, active: bool, colors: &Colors) -> egui::Response {
+    let text_color = if active {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), FontId::proportional(12.5), text_color);
+    let size = egui::vec2(galley.size().x + 22.0, 26.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let fill = if active {
+            colors.chip_active_fill
+        } else {
+            colors.chip_fill
+        };
+        let border = if active {
+            ui.visuals().selection.stroke.color
+        } else {
+            colors.chip_border
+        };
+        let radius = CornerRadius::same(7);
+        ui.painter().rect_filled(rect, radius, fill);
+        ui.painter()
+            .rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
+        ui.painter().galley(
+            egui::pos2(
+                rect.center().x - galley.size().x / 2.0,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            text_color,
+        );
+    }
+
+    response
+}
+
+/// A small-caps section heading.
+fn section_header(ui: &mut egui::Ui, section: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        section.to_uppercase(),
+        FontId::proportional(11.0),
+        ui.visuals().weak_text_color(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +814,14 @@ mod tests {
 
     fn entry(label: &str, hint: &str) -> PaletteEntry {
         PaletteEntry::new(label).with_hint(hint)
+    }
+
+    fn config(id: &str) -> PaletteConfig<'_> {
+        PaletteConfig {
+            id,
+            placeholder: "Search…",
+            ..PaletteConfig::default()
+        }
     }
 
     #[test]
@@ -589,6 +915,63 @@ mod tests {
         assert!(e.search_text().contains("Easy"));
     }
 
+    fn tagged(label: &str, section: &str, tags: &[&str]) -> PaletteEntry {
+        PaletteEntry::new(label)
+            .with_section(section)
+            .with_tags(tags.iter().map(|tag| (*tag).to_string()))
+    }
+
+    #[test]
+    fn an_empty_query_groups_rows_by_section() {
+        let entries = vec![
+            tagged("a", "Todo", &["todo"]),
+            tagged("b", "Solved", &["solved"]),
+            tagged("c", "Todo", &["todo"]),
+            tagged("d", "Solved", &["solved"]),
+        ];
+        // "Solved" first appears after "Todo", but within each section the
+        // original order is kept.
+        assert_eq!(visible_matches("", &entries, None), vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn a_chip_filter_narrows_by_tag() {
+        let entries = vec![
+            tagged("a", "Solved", &["easy", "solved"]),
+            tagged("b", "Todo", &["hard", "todo"]),
+            tagged("c", "Solved", &["hard", "solved"]),
+        ];
+        // Grouping still applies with a chip: "Solved" first appears before
+        // "Todo", so the hard rows come back as [c, b].
+        assert_eq!(visible_matches("", &entries, Some("hard")), vec![2, 1]);
+        assert_eq!(visible_matches("", &entries, Some("solved")), vec![0, 2]);
+        assert!(visible_matches("", &entries, Some("medium")).is_empty());
+    }
+
+    #[test]
+    fn a_query_and_a_chip_compose() {
+        let entries = vec![
+            tagged("Two Sum", "Solved", &["easy", "solved"]),
+            tagged("Two Sum II", "Solved", &["medium", "solved"]),
+            tagged("Median", "Todo", &["hard", "todo"]),
+        ];
+        // "two" ranks both Two Sum rows; the chip then keeps only the easy one.
+        let matched = visible_matches("two", &entries, Some("easy"));
+        assert_eq!(matched, vec![0]);
+    }
+
+    #[test]
+    fn a_query_does_not_group_rows() {
+        // With a query the list is a ranked flat view, not a grouped one:
+        // "a" matches every row and they come back in score order.
+        let entries = vec![
+            tagged("alpha", "Todo", &[]),
+            tagged("beta", "Solved", &[]),
+            tagged("gamma", "Todo", &[]),
+        ];
+        assert_eq!(visible_matches("a", &entries, None), vec![0, 1, 2]);
+    }
+
     #[test]
     fn palette_state_opens_clean_and_closes_clean() {
         let mut state = PaletteState::default();
@@ -598,13 +981,16 @@ mod tests {
         assert!(state.is_open());
         assert_eq!(state.query(), "");
         assert_eq!(state.selected, 0);
+        assert_eq!(state.active_chip(), None);
 
         state.query = "abc".into();
         state.selected = 5;
+        state.chip = Some("easy".into());
         state.close();
         assert!(!state.is_open());
         assert_eq!(state.query(), "");
         assert_eq!(state.selected, 0);
+        assert_eq!(state.active_chip(), None);
         assert!(!state.grab_focus);
     }
 
@@ -616,14 +1002,54 @@ mod tests {
         ];
         let ctx = egui::Context::default();
         let mut state = PaletteState::default();
-        state.open();
 
         for query in ["", "theme", "zzzz"] {
             state.open();
             state.query = query.to_string();
             let mut output = ctx.run_ui(Default::default(), |_ui| {
-                let outcome = show(&ctx, &mut state, "test", "Search…", &entries, None);
+                let outcome = show(&ctx, &mut state, &entries, &config("test"));
                 assert!(outcome.chosen.is_none(), "nothing should be chosen");
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn palette_renders_with_chips_sections_and_shortcuts() {
+        let entries = vec![
+            entry("1. Two Sum", "Easy · solved")
+                .with_icon(glyphs::SOLVED)
+                .with_section("Solved")
+                .with_tags(["easy", "solved"]),
+            entry("4. Median", "Hard · todo")
+                .with_icon(glyphs::TODO)
+                .with_section("Todo")
+                .with_tags(["hard", "todo"]),
+            PaletteEntry::new("Quit Leetr")
+                .with_section("App")
+                .with_shortcut("Ctrl Q"),
+        ];
+        let chips = vec![
+            PaletteChip::new("all", "All"),
+            PaletteChip::new("easy", "Easy"),
+            PaletteChip::new("solved", "Solved"),
+        ];
+        let cfg = PaletteConfig {
+            id: "problems",
+            placeholder: "Jump to a problem…",
+            search_badge: Some("Ctrl P"),
+            chips,
+            empty_action: None,
+        };
+
+        let ctx = egui::Context::default();
+        let mut state = PaletteState::default();
+
+        for chip in [None, Some("easy".to_string()), Some("solved".to_string())] {
+            state.open();
+            state.chip = chip;
+            let mut output = ctx.run_ui(Default::default(), |_ui| {
+                let _ = show(&ctx, &mut state, &entries, &cfg);
             });
             output.textures_delta.clear();
         }
@@ -655,7 +1081,7 @@ mod tests {
 
         let mut chosen = None;
         let mut output = ctx.run_ui(key_event(Key::Enter), |_ui| {
-            chosen = show(&ctx, &mut state, "t", "…", &entries, None).chosen;
+            chosen = show(&ctx, &mut state, &entries, &config("t")).chosen;
         });
         output.textures_delta.clear();
 
@@ -670,13 +1096,13 @@ mod tests {
         state.open();
 
         let mut output = ctx.run_ui(key_event(Key::ArrowDown), |_ui| {
-            show(&ctx, &mut state, "t", "…", &entries, None);
+            show(&ctx, &mut state, &entries, &config("t"));
         });
         output.textures_delta.clear();
         assert_eq!(state.selected, 1);
 
         let mut output = ctx.run_ui(key_event(Key::ArrowUp), |_ui| {
-            show(&ctx, &mut state, "t", "…", &entries, None);
+            show(&ctx, &mut state, &entries, &config("t"));
         });
         output.textures_delta.clear();
         assert_eq!(state.selected, 0);
@@ -690,7 +1116,7 @@ mod tests {
         state.open();
 
         let mut output = ctx.run_ui(Default::default(), |_ui| {
-            let mut outcome = show(&ctx, &mut state, "test", "Search…", &entries, None);
+            let mut outcome = show(&ctx, &mut state, &entries, &config("test"));
             outcome.closed = true;
             if outcome.closed {
                 state.close();

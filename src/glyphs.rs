@@ -34,11 +34,14 @@ pub const BULLET: &str = "•";
 pub const MOON: &str = "\u{1F319}";
 pub const SUN: &str = "\u{2600}";
 
+/// Leading icon in the command palettes' search field.
+pub const SEARCH: &str = "\u{1F50D}";
+
 /// Glyphs the UI paints with the proportional font.
 pub const PROPORTIONAL: &[&str] = &[DOT, SOLVED, ATTEMPTED, TODO, REFRESH, PREMIUM, BULLET];
 
 /// Glyphs the UI paints with the monospace font.
-pub const MONOSPACE: &[&str] = &[MOON, SUN];
+pub const MONOSPACE: &[&str] = &[MOON, SUN, SEARCH];
 
 #[cfg(test)]
 mod tests {

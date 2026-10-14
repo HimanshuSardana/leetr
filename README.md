@@ -40,11 +40,17 @@ the difference is the GPU stack rather than this program.
 | **Submit solutions** | Run sample tests and submit, with a verdict panel showing runtime, produced vs expected output and compile/runtime errors |
 | **nvim interoperability** | Edit in your own nvim; Leetr and nvim share a file on disk plus a loopback control API, so nothing is ever copy-pasted |
 | **Dark mode** | A curated dark theme (default) and a matching light theme, persisted in `config.toml` |
-| **`Ctrl+P`** | Fuzzy problem selector — jump to any loaded problem by id, title or slug |
+| **Iosevka Nerd Font** | The whole interface is drawn in Iosevka Nerd Font when it is installed, loaded from the system so the binary stays small |
+| **`Ctrl+P`** | Problem selector — fuzzy jump to any loaded problem, with difficulty/status filter chips and results grouped by status |
 | **`Ctrl+K`** | Command palette — theme, reload, filters, links, quit |
 | **Lightweight** | A **13 MB** release binary linking only `libc`, `libm` and `libgcc` — no GTK, no WebKit, no OpenSSL, no async runtime |
 
 ### Command palettes
+
+Both palettes share one spotlight style: a borderless search field with a key cap on the
+right, small-caps section headers, and rows whose trailing edge carries either a shortcut
+key cap or a muted hint. `Ctrl+P` adds difficulty/status filter chips and groups its results
+by status.
 
 `Ctrl+P` ranks by fuzzy match with bonuses for word boundaries and contiguous runs, so
 `sum` puts **Two Sum** first. When nothing matches locally, an inline
@@ -229,6 +235,7 @@ src/
   config.rs        config.toml + credentials.toml
   theme.rs         dark/light palettes, difficulty colours
   glyphs.rs        every UI symbol, with a test that they exist in the default fonts
+  fonts.rs         loads Iosevka Nerd Font from the system (egui defaults stay as fallbacks)
   editor.rs        workspaces, per-language extensions, buffers, mtime reloading
   nvim.rs          editor launch strategy + embedded nvim plugin + installer
   interop.rs       loopback control API (tiny_http)
@@ -239,7 +246,7 @@ src/
     html.rs        statement HTML -> rich-text blocks
     submit.rs      judge protocol, verdicts, solved-guard
   ui/
-    problem_list.rs  virtualised list, filters
+    problem_list.rs  the sidebar: brand, quick actions, filters, virtualised list
     statement.rs     statement rendering
     code_editor.rs   editor pane + verdict panel
     palette.rs       fuzzy matching + Ctrl+K / Ctrl+P
@@ -290,6 +297,10 @@ exercised against the real judge without spending an attempt. That is what surfa
   server-side search.
 * The judge is polled every 700ms for up to 30s, with a short retry on the rate limiting
   LeetCode applies when you press Run several times quickly.
+* **The font is loaded, not bundled.** Iosevka Nerd Font is ~14 MB per face, so shipping it
+  would more than double the binary for a cosmetic default. Leetr looks for it under the
+  usual font directories and keeps egui's bundled fonts *behind* it as glyph fallbacks, so a
+  machine without Iosevka still renders every symbol the UI paints.
 * **Link targets are dropped, their text is kept.** Measured before deciding: 44 problems
   contained 5 `<a href>`s between them, all incidental references to Wikipedia or cplusplus.com
   whose link text already carries the meaning ("in-place", "Run-length encoding"). Carrying a URL

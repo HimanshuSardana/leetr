@@ -1,18 +1,21 @@
-//! The problem list panel: search box, filters and a virtualised list.
+//! The problem list panel: brand, quick actions, search, filters and a
+//! virtualised list.
 //!
-//! Styled as a quiet, roomy sidebar: a small badge and title, a soft search
-//! field, text-only filters, and single-line rows that lead with a status dot
-//! and truncate long titles rather than wrapping or showing dense metadata.
+//! This panel *is* the app's sidebar, in the manner of a modern workspace app:
+//! a white lettermark with the session line, a "Quick actions" entry that opens
+//! the `Ctrl+K` palette, a soft search field, text-only filters, and
+//! single-line rows that lead with a status dot and truncate long titles rather
+//! than wrapping or showing dense metadata.
 
 use egui::text::LayoutJob;
 use egui::{
-    Align, Color32, CornerRadius, FontId, Label, Layout, RichText, Sense, TextEdit, TextFormat, Ui,
-    UiBuilder, Vec2,
+    Align, Align2, Color32, CornerRadius, FontId, Label, Layout, RichText, Sense, Stroke,
+    StrokeKind, TextEdit, TextFormat, Ui, UiBuilder, Vec2,
 };
 
 use crate::glyphs;
 use crate::model::{Difficulty, Problem, ProblemStatus};
-use crate::theme;
+use crate::theme::{self, Theme};
 
 /// Height of a single list row. Roomy, like a modern sidebar.
 const ROW_HEIGHT: f32 = 34.0;
@@ -20,6 +23,15 @@ const ROW_HEIGHT: f32 = 34.0;
 const SIDE_PADDING: f32 = 10.0;
 /// Radius of the small leading dot.
 const DOT_RADIUS: f32 = 3.5;
+
+/// The chrome drawn at the top of the panel.
+pub struct Header<'a> {
+    /// Session line under the app name, e.g. `alice · 152 solved`.
+    pub session: &'a str,
+    /// Colour for the session line; `None` falls back to the muted text colour.
+    pub session_color: Option<Color32>,
+    pub theme: Theme,
+}
 
 /// Filters applied to the loaded problem list.
 #[derive(Debug, Clone, Default)]
@@ -81,11 +93,23 @@ pub struct ProblemListAction {
     pub load_more: bool,
     pub server_search: Option<String>,
     pub refresh: bool,
+    /// Return to the full-width list, dropping the open problem.
+    pub show_all: bool,
+    /// Open the `Ctrl+K` command palette from the "Quick actions" row.
+    pub open_actions: bool,
+    /// Flip the colour scheme from the header toggle.
+    pub toggle_theme: bool,
 }
 
 impl ProblemListAction {
     pub fn is_empty(&self) -> bool {
-        self.open.is_none() && !self.load_more && self.server_search.is_none() && !self.refresh
+        self.open.is_none()
+            && !self.load_more
+            && self.server_search.is_none()
+            && !self.refresh
+            && !self.show_all
+            && !self.open_actions
+            && !self.toggle_theme
     }
 }
 
@@ -94,6 +118,7 @@ impl ProblemListAction {
 pub fn show(
     ui: &mut Ui,
     state: &mut ProblemListState,
+    header: &Header<'_>,
     problems: &[Problem],
     total: u32,
     loading: bool,
@@ -107,11 +132,13 @@ pub fn show(
         .frame(egui::Frame::NONE.inner_margin(egui::Margin {
             left: SIDE_PADDING as i8,
             right: SIDE_PADDING as i8,
-            top: 10,
+            top: 12,
             bottom: 6,
         }))
         .show(ui, |ui| {
-            header(ui, problems.len(), total, loading, &mut action);
+            chrome(ui, header, &mut action);
+            ui.add_space(12.0);
+            header_row(ui, problems.len(), total, loading, &mut action);
             ui.add_space(10.0);
             search_field(ui, state);
             ui.add_space(8.0);
@@ -193,11 +220,173 @@ pub fn show(
 // Header, search, filters
 // ---------------------------------------------------------------------------
 
-fn header(ui: &mut Ui, loaded: usize, total: u32, loading: bool, action: &mut ProblemListAction) {
+// ---------------------------------------------------------------------------
+// Chrome, search, filters
+// ---------------------------------------------------------------------------
+
+/// The brand block, the theme toggle and the "Quick actions" entry.
+fn chrome(ui: &mut Ui, header: &Header<'_>, action: &mut ProblemListAction) {
     ui.horizontal(|ui| {
-        badge(ui, "L");
-        ui.add_space(8.0);
-        ui.label(RichText::new("Problems").size(15.0));
+        // The brand doubles as a "home" affordance: clicking it drops the open
+        // problem and returns to the full-width list.
+        let brand = ui
+            .horizontal(|ui| {
+                let mark = lettermark(ui);
+                ui.add_space(10.0);
+                let name = ui
+                    .vertical(|ui| {
+                        ui.add_space(1.0);
+                        let title = ui.add(
+                            egui::Label::new(RichText::new("Leetr").size(15.0).strong())
+                                .sense(Sense::click()),
+                        );
+                        ui.label(
+                            RichText::new(header.session)
+                                .color(
+                                    header
+                                        .session_color
+                                        .unwrap_or_else(|| ui.visuals().weak_text_color()),
+                                )
+                                .size(11.5),
+                        );
+                        title
+                    })
+                    .inner;
+                mark.union(name)
+            })
+            .inner
+            .on_hover_text("Show all problems");
+        if brand.clicked() {
+            action.show_all = true;
+        }
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let toggle = ui
+                .add(
+                    egui::Button::new(RichText::new(header.theme.icon()).monospace().size(14.0))
+                        .frame(false),
+                )
+                .on_hover_text(format!("Switch to {} mode", header.theme.toggled().label()));
+            if toggle.clicked() {
+                action.toggle_theme = true;
+            }
+        });
+    });
+
+    ui.add_space(12.0);
+    if quick_actions_row(ui).clicked() {
+        action.open_actions = true;
+    }
+    ui.add_space(8.0);
+    divider(ui);
+}
+
+/// A rounded, dark square holding a white `L`.
+///
+/// The fill is fixed rather than themed: the reference mark is a dark tile with
+/// a light glyph, and a theme-following tile would put a white `L` on a pale
+/// square in light mode.
+fn lettermark(ui: &mut Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let radius = CornerRadius::same(8);
+    ui.painter()
+        .rect_filled(rect, radius, Color32::from_rgb(0x24, 0x28, 0x2f));
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, Color32::from_rgb(0x3a, 0x40, 0x49)),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "L",
+        FontId::proportional(16.0),
+        Color32::WHITE,
+    );
+    response
+}
+
+/// The full-width "Quick actions" row with its `Ctrl K` key cap.
+fn quick_actions_row(ui: &mut Ui) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect.shrink2(Vec2::new(0.0, 1.0)),
+            CornerRadius::same(7),
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 6.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Quick actions",
+        FontId::proportional(13.0),
+        ui.visuals().text_color(),
+    );
+
+    // Right-aligned key cap.
+    let galley = ui.painter().layout_no_wrap(
+        "Ctrl K".to_owned(),
+        FontId::monospace(11.0),
+        ui.visuals().weak_text_color(),
+    );
+    let size = Vec2::new(galley.size().x + 16.0, 20.0);
+    let cap = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - size.x, rect.center().y - size.y / 2.0),
+        size,
+    );
+    let radius = CornerRadius::same(5);
+    ui.painter()
+        .rect_filled(cap, radius, ui.visuals().widgets.inactive.weak_bg_fill);
+    ui.painter().rect_stroke(
+        cap,
+        radius,
+        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        cap.center(),
+        Align2::CENTER_CENTER,
+        "Ctrl K",
+        FontId::monospace(11.0),
+        ui.visuals().weak_text_color(),
+    );
+
+    response
+}
+
+/// A hairline separator spanning the panel.
+fn divider(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+}
+
+/// The section title, problem count and reload control.
+fn header_row(
+    ui: &mut Ui,
+    loaded: usize,
+    total: u32,
+    loading: bool,
+    action: &mut ProblemListAction,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Problems").size(13.0).strong());
         ui.add_space(2.0);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -222,25 +411,6 @@ fn header(ui: &mut Ui, loaded: usize, total: u32, loading: bool, action: &mut Pr
             }
         });
     });
-}
-
-/// A small rounded square with a letter, like a project avatar.
-fn badge(ui: &mut Ui, letter: &str) {
-    let size = Vec2::splat(24.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(7), theme::ACCENT);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        letter,
-        FontId::proportional(13.0),
-        Color32::from_rgb(0x1b, 0x14, 0x08),
-    );
 }
 
 fn search_field(ui: &mut Ui, state: &mut ProblemListState) {
@@ -653,6 +823,11 @@ mod tests {
         let ctx = egui::Context::default();
         let problems = sample();
         let mut state = ProblemListState::default();
+        let header = Header {
+            session: "browse-only",
+            session_color: None,
+            theme: Theme::Dark,
+        };
 
         for (list, loading, error) in [
             (&[][..], true, None),
@@ -661,7 +836,9 @@ mod tests {
             (&[][..], false, None),
         ] {
             let mut output = ctx.run_ui(Default::default(), |ui| {
-                let _ = show(ui, &mut state, list, 42, loading, error, true, None);
+                let _ = show(
+                    ui, &mut state, &header, list, 42, loading, error, true, None,
+                );
             });
             output.textures_delta.clear();
         }

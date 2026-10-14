@@ -66,6 +66,7 @@ const MAX_PALETTE_PROBLEMS: usize = 1500;
 enum Action {
     ToggleTheme,
     SelectProblem,
+    ShowProblems,
     RefreshProblems,
     LoadMore,
     ClearFilters,
@@ -84,6 +85,7 @@ impl Action {
         match self {
             Self::ToggleTheme => "Toggle theme",
             Self::SelectProblem => "Go to problem",
+            Self::ShowProblems => "Show all problems",
             Self::RefreshProblems => "Reload problem list",
             Self::LoadMore => "Load more problems",
             Self::ClearFilters => "Clear problem filters",
@@ -102,6 +104,7 @@ impl Action {
 const ALL_ACTIONS: &[Action] = &[
     Action::ToggleTheme,
     Action::SelectProblem,
+    Action::ShowProblems,
     Action::RefreshProblems,
     Action::LoadMore,
     Action::ClearFilters,
@@ -110,6 +113,17 @@ const ALL_ACTIONS: &[Action] = &[
     Action::CopyProblemLink,
     Action::Quit,
 ];
+
+/// One row of the `Ctrl+K` catalog: action, hint, icon, section, shortcut and
+/// whether it applies right now.
+type ActionRow = (
+    Action,
+    String,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    bool,
+);
 
 /// Reduce a palette outcome to a chosen row index.
 ///
@@ -120,6 +134,16 @@ fn resolve_palette_choice(state: &mut PaletteState, outcome: &PaletteOutcome) ->
         state.close();
     }
     outcome.chosen
+}
+
+/// Transport form of the auth badge, for the control API.
+fn auth_state_of(badge: &AuthBadge) -> interop::AuthState {
+    match badge {
+        AuthBadge::SignedIn { .. } => interop::AuthState::SignedIn,
+        AuthBadge::Rejected => interop::AuthState::Rejected,
+        AuthBadge::Checking => interop::AuthState::Checking,
+        AuthBadge::BrowseOnly => interop::AuthState::BrowseOnly,
+    }
 }
 
 /// Which auth badge to show.
@@ -142,6 +166,23 @@ fn auth_badge_for(
         // Not checked yet.
         None if credentials_configured => AuthBadge::Checking,
         None => AuthBadge::BrowseOnly,
+    }
+}
+
+/// The compact session line shown under the app name in the problem panel.
+fn session_line(badge: &AuthBadge) -> (String, Option<egui::Color32>) {
+    match badge {
+        AuthBadge::SignedIn { username, solved } => {
+            let text = if username.is_empty() {
+                format!("signed in · {solved} solved")
+            } else {
+                format!("{username} · {solved} solved")
+            };
+            (text, Some(crate::theme::SUCCESS))
+        }
+        AuthBadge::Rejected => ("session rejected".to_string(), Some(crate::theme::DANGER)),
+        AuthBadge::Checking => ("checking session…".to_string(), None),
+        AuthBadge::BrowseOnly => ("browse-only".to_string(), Some(crate::theme::WARNING)),
     }
 }
 
@@ -240,6 +281,9 @@ impl LeetrApp {
 
         // Restore the persisted colour scheme before the first frame.
         config.theme.apply(&cc.egui_ctx);
+
+        // Draw the whole interface in Iosevka Nerd Font when it is installed.
+        crate::fonts::install(&cc.egui_ctx);
 
         let client = match LeetCodeClient::new(credentials.clone()) {
             Ok(client) => client,
@@ -426,6 +470,23 @@ impl LeetrApp {
         });
     }
 
+    /// Return to the full-width problem list, dropping the open problem.
+    fn close_problem(&mut self) {
+        if self.selected.is_none() {
+            return;
+        }
+        self.selected = None;
+        self.detail = None;
+        self.detail_blocks.clear();
+        self.detail_error = None;
+        self.detail_loading = false;
+        self.code = None;
+        self.languages.clear();
+        self.judge = None;
+        self.tab = Tab::Statement;
+        self.status = "Showing all problems".to_string();
+    }
+
     fn drain_events(&mut self) {
         for event in self.bg.drain() {
             match event {
@@ -519,9 +580,13 @@ impl LeetrApp {
                         } else {
                             // Do not claim to be signed in when we are not: an
                             // expired cookie reported "Signed in as (unknown)".
-                            self.status = "credentials rejected — the session has probably \
-                                expired; refresh it in ~/.config/leetr/credentials.toml"
-                                .to_string();
+                            //
+                            // Deliberately NOT written to `status`: that is a
+                            // transient slot which routine messages ("50
+                            // problems loaded") legitimately overwrite, and a
+                            // standing condition does not belong there. The badge
+                            // and its tooltip carry it in the UI, and `auth` in
+                            // the control API carries it to tooling.
                             self.solved.clear();
                         }
                         // `Some(_)` with `signed_in == false` means "checked and
@@ -840,6 +905,7 @@ impl LeetrApp {
                 .is_some_and(|slug| self.solved.contains(slug)),
             ready: self.code.is_some(),
             status: self.status.clone(),
+            auth: auth_state_of(&self.auth_badge()),
             version: interop::API_VERSION.to_string(),
             judge: self.judge.as_ref().map(|judge| interop::JudgeSummary {
                 is_submission: judge.is_submission,
@@ -851,58 +917,6 @@ impl LeetrApp {
             }),
         };
         self.interop_shared.publish(snapshot);
-    }
-
-    fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Statement, "Statement");
-
-            let code_label = match self.code.as_ref() {
-                Some(buffer) => format!("Code · {}", buffer.lang_slug),
-                None => "Code".to_string(),
-            };
-            ui.selectable_value(&mut self.tab, Tab::Code, code_label);
-
-            if let Some(buffer) = self.code.as_ref() {
-                if buffer.is_dirty() {
-                    ui.label(
-                        egui::RichText::new(format!("{} unsaved", glyphs::DOT))
-                            .color(crate::theme::WARNING)
-                            .small(),
-                    );
-                }
-            }
-
-            if let Some(judge) = self.judge.as_ref().filter(|judge| !judge.running) {
-                if let Some(err) = judge.error.as_ref() {
-                    ui.label(egui::RichText::new(err).color(crate::theme::DANGER).small());
-                } else {
-                    ui.label(
-                        egui::RichText::new(judge.verdict.label())
-                            .color(code_editor::verdict_color(judge.verdict))
-                            .small()
-                            .strong(),
-                    );
-                }
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let port = self
-                    .interop
-                    .as_ref()
-                    .map(|server| server.port().to_string())
-                    .unwrap_or_else(|| "off".to_string());
-                ui.label(
-                    egui::RichText::new(format!("control API :{port}"))
-                        .weak()
-                        .small(),
-                )
-                .on_hover_text(
-                    "The bundled nvim plugin talks to Leetr on this port\n\
-                     (see `leetr install-nvim-plugin`)",
-                );
-            });
-        });
     }
 
     fn code_pane(&mut self, ui: &mut egui::Ui) {
@@ -969,84 +983,106 @@ impl LeetrApp {
         let has_more = (self.problems.len() as u32) < self.total;
         let slug = self.selected.clone().unwrap_or_default();
 
-        let catalog: [(Action, &str, String, String, bool); 9] = [
+        // (action, hint, icon, section, shortcut, enabled)
+        let catalog: [ActionRow; 10] = [
             (
-                Action::ToggleTheme,
-                Action::ToggleTheme.search_label(),
-                format!("switch to {} mode", theme.toggled().label()),
-                theme.toggled().icon().to_string(),
+                Action::SelectProblem,
+                "Ctrl+P problem selector".to_string(),
+                glyphs::BULLET,
+                "Quick actions",
+                Some("Ctrl P"),
                 true,
             ),
             (
-                Action::SelectProblem,
-                Action::SelectProblem.search_label(),
-                "Ctrl+P problem selector".to_string(),
-                glyphs::BULLET.to_string(),
-                true,
+                Action::ShowProblems,
+                "back to the full list".to_string(),
+                glyphs::BULLET,
+                "Quick actions",
+                None,
+                has_selection,
             ),
             (
                 Action::RefreshProblems,
-                Action::RefreshProblems.search_label(),
                 "refetch the first page".to_string(),
-                glyphs::REFRESH.to_string(),
+                glyphs::REFRESH,
+                "Problem list",
+                None,
                 true,
             ),
             (
                 Action::LoadMore,
-                Action::LoadMore.search_label(),
                 "fetch the next page".to_string(),
-                glyphs::BULLET.to_string(),
+                glyphs::BULLET,
+                "Problem list",
+                None,
                 has_more,
             ),
             (
                 Action::ClearFilters,
-                Action::ClearFilters.search_label(),
                 "reset search, difficulty and status".to_string(),
-                glyphs::BULLET.to_string(),
+                glyphs::BULLET,
+                "Problem list",
+                None,
                 self.list_state.is_filtered(),
             ),
             (
                 Action::TogglePremiumFilter,
-                Action::TogglePremiumFilter.search_label(),
                 if self.list_state.hide_premium {
                     "currently hidden".to_string()
                 } else {
                     "currently shown".to_string()
                 },
-                glyphs::PREMIUM.to_string(),
+                glyphs::PREMIUM,
+                "Problem list",
+                None,
                 true,
             ),
             (
                 Action::OpenOnLeetCode,
-                Action::OpenOnLeetCode.search_label(),
                 slug.clone(),
-                glyphs::BULLET.to_string(),
+                glyphs::BULLET,
+                "Current problem",
+                None,
                 has_selection,
             ),
             (
                 Action::CopyProblemLink,
-                Action::CopyProblemLink.search_label(),
                 slug,
-                glyphs::BULLET.to_string(),
+                glyphs::BULLET,
+                "Current problem",
+                None,
                 has_selection,
             ),
             (
+                Action::ToggleTheme,
+                format!("switch to {} mode", theme.toggled().label()),
+                theme.toggled().icon(),
+                "Application",
+                None,
+                true,
+            ),
+            (
                 Action::Quit,
-                Action::Quit.search_label(),
                 String::new(),
-                glyphs::BULLET.to_string(),
+                glyphs::BULLET,
+                "Application",
+                None,
                 true,
             ),
         ];
 
         catalog
             .into_iter()
-            .filter(|(_, _, _, _, enabled)| *enabled)
-            .map(|(action, label, hint, icon, _)| {
-                (
-                    action,
-                    PaletteEntry::new(label).with_hint(hint).with_icon(icon),
-                )
+            .filter(|row| row.5)
+            .map(|(action, hint, icon, section, shortcut, _)| {
+                let mut entry = PaletteEntry::new(action.search_label())
+                    .with_hint(hint)
+                    .with_icon(icon)
+                    .with_section(section);
+                if let Some(shortcut) = shortcut {
+                    entry = entry.with_shortcut(shortcut);
+                }
+                (action, entry)
             })
             .collect()
     }
@@ -1058,6 +1094,7 @@ impl LeetrApp {
                 self.set_theme(next, ctx);
             }
             Action::SelectProblem => self.problems_palette.open(),
+            Action::ShowProblems => self.close_problem(),
             Action::RefreshProblems => self.load_first_page(),
             Action::LoadMore => self.load_next_page(),
             Action::ClearFilters => self.list_state.clear_filters(),
@@ -1094,10 +1131,14 @@ impl LeetrApp {
         let outcome = ui::palette::show(
             ctx,
             &mut self.actions_palette,
-            "actions",
-            "Type a command…",
             &entries,
-            None,
+            &ui::palette::PaletteConfig {
+                id: "actions",
+                placeholder: "Type a command…",
+                search_badge: Some("Ctrl K"),
+                chips: Vec::new(),
+                empty_action: None,
+            },
         );
         if let Some(index) = resolve_palette_choice(&mut self.actions_palette, &outcome) {
             if let Some((action, _)) = catalog.get(index) {
@@ -1119,6 +1160,11 @@ impl LeetrApp {
                             problem.status.label()
                         ))
                         .with_icon(problem.status.marker().to_string())
+                        .with_section(problem.status.label())
+                        .with_tags([
+                            problem.difficulty.label().to_ascii_lowercase(),
+                            problem.status.label().to_string(),
+                        ])
                 })
                 .collect();
 
@@ -1131,10 +1177,22 @@ impl LeetrApp {
             let outcome = ui::palette::show(
                 ctx,
                 &mut self.problems_palette,
-                "problems",
-                "Jump to a problem…",
                 &entries,
-                search_label.as_deref(),
+                &ui::palette::PaletteConfig {
+                    id: "problems",
+                    placeholder: "Jump to a problem…",
+                    search_badge: Some("Ctrl P"),
+                    chips: vec![
+                        ui::palette::PaletteChip::new("all", "All"),
+                        ui::palette::PaletteChip::new("easy", "Easy"),
+                        ui::palette::PaletteChip::new("medium", "Medium"),
+                        ui::palette::PaletteChip::new("hard", "Hard"),
+                        ui::palette::PaletteChip::new("solved", "Solved"),
+                        ui::palette::PaletteChip::new("attempted", "Attempted"),
+                        ui::palette::PaletteChip::new("todo", "Todo"),
+                    ],
+                    empty_action: search_label.as_deref(),
+                },
             );
 
             if outcome.empty_action {
@@ -1172,39 +1230,7 @@ impl LeetrApp {
 
     // -- panels -------------------------------------------------------------
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let theme = self.config.theme;
-        let mut requested_theme = None;
-
-        ui.horizontal(|ui| {
-            ui.heading("Leetr");
-            ui.separator();
-            ui.label(
-                egui::RichText::new("lightweight LeetCode client")
-                    .weak()
-                    .small(),
-            );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
-                ui.separator();
-
-                let toggle = ui
-                    .button(theme_button_job(theme))
-                    .on_hover_text(format!("Switch to {} mode", theme.toggled().label()));
-                if toggle.clicked() {
-                    requested_theme = Some(theme.toggled());
-                }
-            });
-        });
-
-        if let Some(next) = requested_theme {
-            let ctx = ui.ctx().clone();
-            self.set_theme(next, &ctx);
-        }
-    }
-
-    fn handle_list_action(&mut self, action: ProblemListAction) {
+    fn handle_list_action(&mut self, action: ProblemListAction, ctx: &egui::Context) {
         if action.refresh {
             self.load_first_page();
         }
@@ -1216,6 +1242,16 @@ impl LeetrApp {
         }
         if let Some(slug) = action.open {
             self.open_problem(slug);
+        }
+        if action.show_all {
+            self.close_problem();
+        }
+        if action.open_actions {
+            self.actions_palette.open();
+        }
+        if action.toggle_theme {
+            let next = self.config.theme.toggled();
+            self.set_theme(next, ctx);
         }
     }
 }
@@ -1307,7 +1343,7 @@ impl eframe::App for LeetrApp {
             if tab_to_code {
                 self.tab = Tab::Code;
             }
-            if toggle_sidebar {
+            if toggle_sidebar && self.selected.is_some() {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
                 self.status = if self.sidebar_collapsed {
                     "Sidebar hidden".to_string()
@@ -1317,66 +1353,93 @@ impl eframe::App for LeetrApp {
             }
         }
 
-        egui::Panel::top("leetr-toolbar").show(ui, |ui| {
-            ui.add_space(2.0);
-            self.toolbar(ui);
-            ui.add_space(2.0);
-        });
-
         egui::Panel::bottom("leetr-status").show(ui, |ui| {
             let badge = self.auth_badge();
+            let api_port = self
+                .interop
+                .as_ref()
+                .map(|server| server.port())
+                .unwrap_or(self.config.interop_port);
             ui::status_bar::show(
                 ui,
                 &self.config,
                 &badge,
                 &self.status,
                 self.error.as_deref(),
+                api_port,
             );
         });
+
+        // The problem list is the app's sidebar. Its chrome (brand, session
+        // line, quick actions) is drawn by the panel itself.
+        let badge = self.auth_badge();
+        let (session, session_color) = session_line(&badge);
+        let header = ui::problem_list::Header {
+            session: &session,
+            session_color,
+            theme: self.config.theme,
+        };
 
         let mut action = ProblemListAction::default();
         let has_more = (self.problems.len() as u32) < self.total;
 
-        // `show_collapsible` slides the panel off-screen and clips its contents
-        // while doing so, and keeps a thin grab handle so the user can drag it
-        // back open. Ctrl+B flips the same flag.
-        //
-        // Note the polarity: the panel wants `is_expanded`, our field is
-        // `sidebar_collapsed`. Passing the field directly renders the sidebar
-        // collapsed (invisible) from the start.
-        let mut expanded = !self.sidebar_collapsed;
-        egui::Panel::left("leetr-problems")
-            .resizable(true)
-            .default_size(420.0)
-            .size_range(egui::Rangef::new(280.0, 720.0))
-            .show_collapsible(ui, &mut expanded, |ui| {
+        if self.selected.is_none() {
+            // Nothing is open, so the list spans the whole window.
+            egui::CentralPanel::default_margins().show(ui, |ui| {
                 action = ui::problem_list::show(
                     ui,
                     &mut self.list_state,
+                    &header,
                     &self.problems,
                     self.total,
                     self.list_loading,
                     self.list_error.as_deref(),
                     has_more,
-                    self.selected.as_deref(),
+                    None,
                 );
             });
+        } else {
+            // A problem is open: the list shrinks to a sidebar on the left and
+            // the statement/code fills the wider column beside it.
+            //
+            // `show_collapsible` slides the panel off-screen and clips its
+            // contents while doing so, and keeps a thin grab handle so the user
+            // can drag it back open. Ctrl+B flips the same flag.
+            //
+            // Note the polarity: the panel wants `is_expanded`, our field is
+            // `sidebar_collapsed`. Passing the field directly renders the
+            // sidebar collapsed (invisible) from the start.
+            let mut expanded = !self.sidebar_collapsed;
+            egui::Panel::left("leetr-problems")
+                .resizable(true)
+                .default_size(340.0)
+                .size_range(egui::Rangef::new(240.0, 560.0))
+                .show_collapsible(ui, &mut expanded, |ui| {
+                    action = ui::problem_list::show(
+                        ui,
+                        &mut self.list_state,
+                        &header,
+                        &self.problems,
+                        self.total,
+                        self.list_loading,
+                        self.list_error.as_deref(),
+                        has_more,
+                        self.selected.as_deref(),
+                    );
+                });
 
-        // The panel flips `expanded` itself when the user drags the resize
-        // handle closed or double-clicks the edge; mirror that back.
-        if expanded == self.sidebar_collapsed {
-            self.sidebar_collapsed = !expanded;
-            self.status = if self.sidebar_collapsed {
-                "Sidebar hidden".to_string()
-            } else {
-                "Sidebar shown".to_string()
-            };
-        }
+            // The panel flips `expanded` itself when the user drags the resize
+            // handle closed or double-clicks the edge; mirror that back.
+            if expanded == self.sidebar_collapsed {
+                self.sidebar_collapsed = !expanded;
+                self.status = if self.sidebar_collapsed {
+                    "Sidebar hidden".to_string()
+                } else {
+                    "Sidebar shown".to_string()
+                };
+            }
 
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            self.tab_bar(ui);
-            ui.add_space(2.0);
-            match self.tab {
+            egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
                 Tab::Statement => ui::statement::show(
                     ui,
                     self.detail.as_ref(),
@@ -1385,41 +1448,14 @@ impl eframe::App for LeetrApp {
                     self.detail_error.as_deref(),
                 ),
                 Tab::Code => self.code_pane(ui),
-            }
-        });
+            });
+        }
 
-        self.handle_list_action(action);
-        self.show_palettes(ui.ctx());
+        let ctx = ui.ctx().clone();
+        self.handle_list_action(action, &ctx);
+        self.show_palettes(&ctx);
         self.publish_snapshot();
     }
-}
-
-/// Label for the theme toggle.
-///
-/// The sun/moon glyphs only exist in the default *monospace* font's fallback,
-/// so the icon and the label are rendered as two sections with different fonts
-/// (`Color32::PLACEHOLDER` keeps the button's own text colour).
-fn theme_button_job(theme: Theme) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        theme.icon(),
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::monospace(14.0),
-            color: egui::Color32::PLACEHOLDER,
-            ..Default::default()
-        },
-    );
-    job.append(
-        &format!(" {}", theme.label()),
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::proportional(14.0),
-            color: egui::Color32::PLACEHOLDER,
-            ..Default::default()
-        },
-    );
-    job
 }
 
 /// Launch the GUI. Blocks until the window is closed.
@@ -1561,6 +1597,24 @@ mod tests {
             None
         );
         assert!(state.is_open(), "typing must not close the palette");
+    }
+
+    #[test]
+    fn every_badge_maps_to_a_distinct_auth_state() {
+        use interop::AuthState;
+        assert_eq!(
+            auth_state_of(&AuthBadge::SignedIn {
+                username: "a".into(),
+                solved: 1
+            }),
+            AuthState::SignedIn
+        );
+        assert_eq!(auth_state_of(&AuthBadge::Rejected), AuthState::Rejected);
+        assert_eq!(auth_state_of(&AuthBadge::Checking), AuthState::Checking);
+        assert_eq!(auth_state_of(&AuthBadge::BrowseOnly), AuthState::BrowseOnly);
+        // "expired cookie" and "no credentials" must never be conflated, since
+        // they need different fixes.
+        assert_ne!(AuthState::Rejected, AuthState::BrowseOnly);
     }
 
     #[test]
