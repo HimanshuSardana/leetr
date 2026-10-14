@@ -2,7 +2,7 @@
 name = "leetr"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.75"
 description = "A lightweight egui LeetCode client with first-class nvim interoperability"
 license = "MIT"
 repository = "https://github.com/HimanshuSardana/leetr"

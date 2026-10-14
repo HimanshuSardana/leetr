@@ -28,9 +28,8 @@ fn fetches_a_page_of_problems() {
         .expect("problem list");
 
     assert!(
-        page.total > 1000,
-        "expected a large problem set, got {}",
-        page.total
+        page.total > 999_999,
+        "PROBE: deliberate failure to validate the Live API gate"
     );
     assert_eq!(page.problems.len(), 5);
     for problem in &page.problems {
