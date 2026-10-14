@@ -50,6 +50,12 @@ mod tests {
     /// `textures_delta` panics inside epaint, so it is cleared here.
     #[test]
     fn every_ui_glyph_exists_in_the_font_it_is_drawn_with() {
+        // Without this the loops below assert nothing if a table is emptied.
+        assert!(
+            !PROPORTIONAL.is_empty() && !MONOSPACE.is_empty(),
+            "glyph tables are empty — the loops would assert nothing"
+        );
+
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(Default::default(), |_ui| {
             let proportional = egui::FontId::proportional(14.0);

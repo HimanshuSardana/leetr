@@ -206,8 +206,32 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    /// Guard against vacuous loops: every table the tests below walk must be
+    /// populated, otherwise a `for` over an empty slice asserts nothing and
+    /// passes. Cheap to check, and it is the difference between a test and a
+    /// decoration.
+    fn assert_tables_are_populated() {
+        assert!(
+            !Command::ALL.is_empty(),
+            "Command::ALL is empty — loops over it would assert nothing"
+        );
+        assert!(
+            !LIST_FLAGS.is_empty(),
+            "LIST_FLAGS is empty — loops over it would assert nothing"
+        );
+        assert!(
+            !SHOW_FLAGS.is_empty(),
+            "SHOW_FLAGS is empty — loops over it would assert nothing"
+        );
+        assert!(
+            !GLOBAL_FLAGS.is_empty(),
+            "GLOBAL_FLAGS is empty — loops over it would assert nothing"
+        );
+    }
+
     #[test]
     fn every_declared_command_parses_back_to_itself() {
+        assert_tables_are_populated();
         for command in Command::ALL {
             assert_eq!(
                 Command::parse(command.name()),
@@ -253,6 +277,7 @@ mod tests {
 
     #[test]
     fn help_lists_every_command_with_its_usage_and_summary() {
+        assert_tables_are_populated();
         let help = help_text();
         for command in Command::ALL {
             assert!(
@@ -272,6 +297,7 @@ mod tests {
 
     #[test]
     fn help_documents_every_flag_with_its_help_text() {
+        assert_tables_are_populated();
         let help = help_text();
         for flag in LIST_FLAGS.iter().chain(SHOW_FLAGS).chain(GLOBAL_FLAGS) {
             assert!(help.contains(flag.flag), "help omits {}", flag.flag);
@@ -288,6 +314,7 @@ mod tests {
     /// because the argument parsing reads it.
     #[test]
     fn every_declared_flag_is_read_by_the_parser() {
+        assert_tables_are_populated();
         const PARSER: &str = include_str!("main.rs");
         for flag in LIST_FLAGS.iter().chain(SHOW_FLAGS) {
             // Match the *quoted* literal. A bare `contains` is too weak: it
@@ -319,6 +346,7 @@ mod tests {
 
     #[test]
     fn flags_are_well_formed() {
+        assert_tables_are_populated();
         for flag in LIST_FLAGS.iter().chain(SHOW_FLAGS).chain(GLOBAL_FLAGS) {
             assert!(
                 flag.flag.starts_with("--") && flag.flag.len() > 2,
