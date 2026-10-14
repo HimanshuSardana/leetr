@@ -122,6 +122,16 @@ fn resolve_palette_choice(state: &mut PaletteState, outcome: &PaletteOutcome) ->
     outcome.chosen
 }
 
+/// Should a plain `Tab` switch from the statement pane to the code pane?
+///
+/// Tab is the standard "move focus" key, so it only doubles as a pane switch
+/// when nothing has keyboard focus. Without the second condition, pressing Tab
+/// while typing in the problem filter teleports the user to the code pane
+/// mid-query (verified in the GUI: 31,699 pixels of view change).
+fn tab_switches_panes(current: Tab, nothing_focused: bool) -> bool {
+    current == Tab::Statement && nothing_focused
+}
+
 /// Canonical URL for a problem.
 fn problem_url(slug: &str) -> String {
     format!("https://leetcode.com/problems/{slug}/")
@@ -1229,7 +1239,15 @@ impl eframe::App for LeetrApp {
                     egui::Key::Enter,
                 )
             });
-            let tab_to_code = if self.tab == Tab::Statement {
+            // Tab switches panes, but only when no widget has keyboard focus.
+            // Tab is the standard "move focus" key, so claiming it while the
+            // user is typing in the filter box teleports them to the code pane
+            // mid-query. This runs before widgets are drawn, so the check has
+            // to happen here rather than relying on the text field to refuse it.
+            let nothing_focused = ui.ctx().memory(|memory| memory.focused().is_none());
+            // Only consume the key when it is actually ours — otherwise the
+            // focused widget must still receive it.
+            let tab_to_code = if tab_switches_panes(self.tab, nothing_focused) {
                 ui.ctx()
                     .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
             } else {
@@ -1511,6 +1529,20 @@ mod tests {
             None
         );
         assert!(state.is_open(), "typing must not close the palette");
+    }
+
+    #[test]
+    fn tab_only_switches_panes_when_nothing_is_focused() {
+        // Focused text field: Tab belongs to the widget, not to us.
+        assert!(!tab_switches_panes(Tab::Statement, false));
+        assert!(!tab_switches_panes(Tab::Code, false));
+
+        // Nothing focused: the shortcut is ours on the statement pane only.
+        assert!(tab_switches_panes(Tab::Statement, true));
+        assert!(
+            !tab_switches_panes(Tab::Code, true),
+            "Tab must not toggle back out of the code pane"
+        );
     }
 
     #[test]
