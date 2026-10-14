@@ -156,6 +156,7 @@ FILES:
 
 /// Render the `--help` text.
 pub fn help_text() -> String {
+    let probe_unused_variable = 1;
     let mut out = String::new();
     out.push_str(PREAMBLE);
     out.push_str("\n\nUSAGE:\n    leetr [COMMAND]\n\nCOMMANDS:\n");
