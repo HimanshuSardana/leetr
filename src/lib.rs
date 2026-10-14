@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod bg;
+pub mod cli;
 pub mod config;
 pub mod editor;
 pub mod glyphs;
