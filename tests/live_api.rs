@@ -334,20 +334,46 @@ fn sample_run_reports_wrong_answer_for_wrong_code() {
 #[ignore = "hits the live LeetCode API"]
 fn statements_across_problems_render_without_leaking_markup() {
     // The parser was written against `two-sum`'s markup, but real statements
-    // vary: `<img>` diagrams, `<ol>`, `<sub>`, `<a>`, `<font>`. Parsing several
-    // structurally different problems is the only way to know the parser copes
-    // — a fixture would just encode my own assumptions again.
+    // vary widely: `<img>` diagrams, `<ol>`, `<sub>`, `<a>`, tables, and very
+    // different `<pre>` examples. A fixture would only encode my assumptions,
+    // so this sweeps a broad and deliberately varied sample of real problems.
     let client = public_client();
     let slugs = [
-        "two-sum",              // the original baseline
-        "add-two-numbers",      // contains an <img> diagram
-        "valid-sudoku",         // contains an <ol>
-        "word-ladder",          // contains <sub>
-        "merge-k-sorted-lists", // heavy on <pre> examples
-        "lru-cache",            // contains <a> links
+        // the original baseline, and one from the same era
+        "two-sum",
+        "median-of-two-sorted-arrays",
+        // images
+        "add-two-numbers",
+        "trapping-rain-water",
+        "rotate-image",
+        // ordered lists
+        "valid-sudoku",
+        "sudoku-solver",
+        // sub/superscript
+        "word-ladder",
+        "n-queens",
+        // external links
+        "lru-cache",
+        "remove-duplicates-from-sorted-array",
+        "count-and-say",
+        "powx-n",
+        // heavy on <pre> examples
+        "merge-k-sorted-lists",
+        "spiral-matrix",
+        "wildcard-matching",
+        "regular-expression-matching",
+        "group-anagrams",
+        "multiply-strings",
+        // long prose and small formulas
+        "integer-to-roman",
+        "generate-parentheses",
+        "jump-game",
+        "permutations",
+        "maximum-subarray",
     ];
 
     let mut with_image = 0;
+    let mut total_blocks = 0usize;
     for slug in slugs {
         let detail = client.fetch_question(slug).expect("statement");
         let blocks = html::parse(&detail.content_html);
@@ -355,11 +381,18 @@ fn statements_across_problems_render_without_leaking_markup() {
 
         assert!(!blocks.is_empty(), "{slug}: parsed to nothing");
         assert!(
+            blocks.len() > 4,
+            "{slug}: only {} blocks — the statement looks truncated",
+            blocks.len()
+        );
+        assert!(
             text.len() > 200,
             "{slug}: suspiciously little text ({} bytes)",
             text.len()
         );
-        for leak in ["<p>", "</", "&lt;", "&nbsp;", "&quot;", "&#"] {
+        for leak in [
+            "<p>", "</", "&lt;", "&nbsp;", "&quot;", "&#", "<img", "<code",
+        ] {
             assert!(
                 !text.contains(leak),
                 "{slug}: `{leak}` leaked into the output"
@@ -368,17 +401,16 @@ fn statements_across_problems_render_without_leaking_markup() {
 
         if text.contains("[image]") || text.contains("[image:") {
             with_image += 1;
-            eprintln!("{slug}: image reference preserved");
         }
-        eprintln!(
-            "{slug}: {} blocks, {} bytes of text",
-            blocks.len(),
-            text.len()
-        );
+        total_blocks += blocks.len();
     }
 
+    eprintln!(
+        "{} problems: {total_blocks} blocks total, {with_image} with image references",
+        slugs.len()
+    );
     assert!(
-        with_image > 0,
-        "at least one of these problems has an <img>; it must not vanish silently"
+        with_image >= 2,
+        "several of these problems carry an <img>; none should vanish silently"
     );
 }
