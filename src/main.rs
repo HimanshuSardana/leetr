@@ -2,58 +2,41 @@
 
 use anyhow::{bail, Result};
 use leetr::app;
+use leetr::cli::{self, Command};
 use leetr::config::{self, Credentials};
 use leetr::leetcode::client::ProblemQuery;
 use leetr::leetcode::{html, LeetCodeClient};
 use leetr::model::{ProblemStatus, QuestionDetail};
 use leetr::nvim;
 
-const HELP: &str = "\
-leetr — a lightweight egui LeetCode client
-
-USAGE:
-    leetr [COMMAND]
-
-COMMANDS:
-    (none)                  Launch the graphical client
-    list [OPTIONS]          List problems (needs the network)
-    show <slug> [--raw]     Print a problem statement as text (--raw: HTML)
-    languages               List submission languages
-    whoami                  Show the configured LeetCode session
-    init                    Write default config + credentials files
-    nvim-plugin             Print the path to the bundled nvim plugin
-    install-nvim-plugin     Install the nvim plugin into your nvim config
-    -h, --help              Print this help
-    -V, --version           Print the version
-
-LIST OPTIONS:
-    --limit N               Page size (default 50)
-    --skip N                Offset into the problem list
-    --search TEXT           Server-side keyword search
-    --solved                Only problems you have solved
-    --todo                  Only unsolved problems
-    --attempted             Only attempted problems
-    --slug                  Also print each problem's slug
-
-FILES:
-    config       ~/.config/leetr/config.toml
-    credentials  ~/.config/leetr/credentials.toml   (never committed)
-    workspace    ~/.local/share/leetr/workspace/
-";
-
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
         None => app::run()?,
-        Some("-h") | Some("--help") => println!("{HELP}"),
+        Some("-h") | Some("--help") => print!("{}", cli::help_text()),
         Some("-V") | Some("--version") => println!("leetr {}", env!("CARGO_PKG_VERSION")),
-        Some("init") => {
+        Some(name) => match Command::parse(name) {
+            Some(command) => run(command, &args[1..])?,
+            None => {
+                eprintln!("error: unknown command `{name}`\n\n{}", cli::help_text());
+                std::process::exit(2);
+            }
+        },
+    }
+
+    Ok(())
+}
+
+/// Dispatch a parsed command.
+fn run(command: Command, args: &[String]) -> Result<()> {
+    match command {
+        Command::Init => {
             let paths = config::seed()?;
             println!("config       {}", paths.config.display());
             println!("credentials  {}", paths.credentials.display());
         }
-        Some("nvim-plugin") => {
+        Command::NvimPlugin => {
             // The plugin is embedded in the binary (`include_str!`), so there is
             // no meaningful "source path" to print — CARGO_MANIFEST_DIR is the
             // machine that built the binary and usually does not exist for the
@@ -63,11 +46,18 @@ fn main() -> Result<()> {
             println!("{}", dest.display());
             println!("the plugin is embedded in this binary; install it with `leetr install-nvim-plugin`");
         }
-        Some("install-nvim-plugin") => cmd_install_nvim_plugin()?,
-        Some(_) => run_command(&args)?,
+        Command::InstallNvimPlugin => cmd_install_nvim_plugin()?,
+        Command::List => cmd_list(&client()?, args)?,
+        Command::Show => cmd_show(&client()?, args)?,
+        Command::Languages => cmd_languages(&client()?)?,
+        Command::Whoami => cmd_whoami(&client()?)?,
     }
 
     Ok(())
+}
+
+fn client() -> Result<LeetCodeClient> {
+    LeetCodeClient::new(Credentials::load())
 }
 
 /// Copy the embedded plugin into the user's nvim config.
@@ -84,21 +74,6 @@ fn cmd_install_nvim_plugin() -> Result<()> {
     println!();
     print!("{}", nvim::install_hint());
     Ok(())
-}
-
-fn run_command(args: &[String]) -> Result<()> {
-    let client = LeetCodeClient::new(Credentials::load())?;
-
-    match args[0].as_str() {
-        "list" => cmd_list(&client, &args[1..]),
-        "show" => cmd_show(&client, &args[1..]),
-        "languages" => cmd_languages(&client),
-        "whoami" => cmd_whoami(&client),
-        other => {
-            eprintln!("error: unknown command `{other}`\n\n{HELP}");
-            std::process::exit(2);
-        }
-    }
 }
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
