@@ -246,7 +246,10 @@ authenticated solved-set lookup, and headless rendering of the real statement an
 list panes. The judge client is tested against a mock judge over real HTTP (headers, CSRF,
 referer, bodies, polling) **plus fixtures copied verbatim from live responses** — an
 earlier hand-written fixture missed that `code_output` is an array for sample runs, which
-only the real API caught.
+only the real API caught. The judge now also has **live** coverage: sample runs
+(`interpret_solution`) execute code without creating a submission, so the verdict path is
+exercised against the real judge without spending an attempt. That is what surfaced the
+`Accepted`-for-wrong-code bug described below.
 
 ## Notes and limitations
 

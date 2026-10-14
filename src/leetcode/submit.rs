@@ -23,6 +23,27 @@ use super::client::LeetCodeClient;
 pub const JUDGE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(700);
 
+/// LeetCode rate-limits the judge. Queueing several runs in quick succession
+/// returns HTTP 429 with an HTML error page, which is easy to hit by pressing
+/// Run twice. Retry a few times with a short backoff before giving up.
+const RATE_LIMIT_ATTEMPTS: usize = 4;
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(6);
+
+/// Render an HTTP error body for a human.
+///
+/// Rate limits and gateway errors come back as a full HTML page; dumping that
+/// markup into the status bar helps nobody, so it is summarised instead.
+pub fn readable_body(status: u16, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.starts_with('<') {
+        return match status {
+            429 => "rate limited by LeetCode — wait a moment and retry".to_string(),
+            _ => "HTML error page from LeetCode".to_string(),
+        };
+    }
+    trim(trimmed, 300)
+}
+
 /// What Leetr will do with a submission request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitDecision {
@@ -226,6 +247,11 @@ pub struct JudgeResult {
     pub expected_output: Option<serde_json::Value>,
     #[serde(default)]
     pub expected_code_answer: Option<serde_json::Value>,
+    /// Per-test-case pass/fail bitmask for a **sample run** (`"1"` = the case
+    /// passed, `"0"` = it failed). Sample runs report `status_msg: "Accepted"`
+    /// when the code merely *ran*, so this is the only signal of correctness.
+    #[serde(default)]
+    pub compare_result: Option<String>,
     #[serde(default)]
     pub std_output: Option<serde_json::Value>,
     #[serde(default)]
@@ -256,10 +282,28 @@ impl JudgeResult {
         if !self.is_finished() {
             return Verdict::Pending;
         }
-        Verdict::from_status(
+
+        let verdict = Verdict::from_status(
             self.status_msg.as_deref().unwrap_or_default(),
             self.status_code,
-        )
+        );
+
+        // A sample run ("Run Code") reports status 10 / "Accepted" whenever the
+        // code *executed*, regardless of whether the answer was right — the
+        // live payload for deliberately wrong code is
+        //   {"status_msg": "Accepted", "compare_result": "0", "total_correct": 0}
+        // so accepting that at face value shows "Accepted" for wrong answers.
+        // Correctness only lives in `compare_result`, so downgrade.
+        if verdict == Verdict::Accepted {
+            if let Some(compare) = self.compare_result.as_deref() {
+                let compare = compare.trim();
+                if !compare.is_empty() && compare.contains('0') {
+                    return Verdict::WrongAnswer;
+                }
+            }
+        }
+
+        verdict
     }
 
     /// Short, single-line summary for the status bar / nvim.
@@ -472,13 +516,13 @@ impl LeetCodeClient {
         }
 
         let response = request.send().with_context(|| format!("GET {url}"))?;
-        let status = response.status();
+        let status = response.status().as_u16();
         let text = response.text().context("reading the check response")?;
 
-        if !status.is_success() {
+        if !(200..300).contains(&status) {
             bail!(
                 "LeetCode returned HTTP {status} for {url}: {}",
-                trim(&text, 200)
+                readable_body(status, &text)
             );
         }
 
@@ -522,31 +566,47 @@ impl LeetCodeClient {
         let url = format!("{}{path}", self.base_url());
         let referer = format!("{}/problems/{slug}/", self.base_url());
 
-        let response = self
-            .http()
-            .post(&url)
-            .header(CONTENT_TYPE, "application/json")
-            .header(REFERER, referer)
-            .header(ORIGIN, self.base_url())
-            .header("X-Requested-With", "XMLHttpRequest")
-            .header(COOKIE, self.credentials().cookie_header())
-            .header("x-csrftoken", self.credentials().csrftoken.clone())
-            .json(&body)
-            .send()
-            .with_context(|| format!("POST {url}"))?;
+        let mut last: Option<(u16, String)> = None;
 
-        let status = response.status();
-        let text = response.text().context("reading the judge response")?;
+        for attempt in 0..RATE_LIMIT_ATTEMPTS {
+            let response = self
+                .http()
+                .post(&url)
+                .header(CONTENT_TYPE, "application/json")
+                .header(REFERER, &referer)
+                .header(ORIGIN, self.base_url())
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header(COOKIE, self.credentials().cookie_header())
+                .header("x-csrftoken", self.credentials().csrftoken.clone())
+                .json(&body)
+                .send()
+                .with_context(|| format!("POST {url}"))?;
 
-        if !status.is_success() {
-            bail!(
-                "LeetCode returned HTTP {status} for {path}: {}",
-                trim(&text, 300)
-            );
+            let status = response.status().as_u16();
+            let text = response.text().context("reading the judge response")?;
+
+            if status == 429 && attempt + 1 < RATE_LIMIT_ATTEMPTS {
+                std::thread::sleep(RATE_LIMIT_BACKOFF);
+                last = Some((status, text));
+                continue;
+            }
+
+            if !(200..300).contains(&status) {
+                bail!(
+                    "LeetCode returned HTTP {status} for {path}: {}",
+                    readable_body(status, &text)
+                );
+            }
+
+            return serde_json::from_str(&text)
+                .with_context(|| format!("decoding the judge response: {}", trim(&text, 300)));
         }
 
-        serde_json::from_str(&text)
-            .with_context(|| format!("decoding the judge response: {}", trim(&text, 300)))
+        let (status, text) = last.expect("at least one attempt");
+        bail!(
+            "LeetCode returned HTTP {status} for {path} after {RATE_LIMIT_ATTEMPTS} attempts: {}",
+            readable_body(status, &text)
+        )
     }
 }
 
@@ -788,6 +848,101 @@ mod tests {
         assert_eq!(result.output_text().as_deref(), Some("[1,2]"));
         assert_eq!(result.expected_text().as_deref(), Some("[0,1]"));
         assert_eq!(result.memory_text().as_deref(), Some("16.5 MB"));
+    }
+
+    #[test]
+    fn html_error_pages_are_summarised_not_dumped() {
+        let html =
+            "<!DOCTYPE html>\n<html><head><title>429 Too Many Requests</title></head></html>";
+        let message = readable_body(429, html);
+        assert_eq!(
+            message,
+            "rate limited by LeetCode — wait a moment and retry"
+        );
+        assert!(
+            !message.contains('<'),
+            "markup must not leak into the message"
+        );
+
+        let message = readable_body(502, html);
+        assert!(message.contains("HTML error page"));
+        assert!(!message.contains('<'));
+    }
+
+    #[test]
+    fn json_error_bodies_are_kept_but_truncated() {
+        let message = readable_body(400, r#"{"error":"slug is required"}"#);
+        assert_eq!(message, r#"{"error":"slug is required"}"#);
+
+        let long = "x".repeat(1000);
+        let message = readable_body(500, &long);
+        assert!(message.chars().count() <= 301, "should be truncated");
+        assert!(message.ends_with('…'));
+    }
+
+    /// Verbatim from a live `interpret_solution` check for code that returns the
+    /// wrong answer. LeetCode still calls it "Accepted".
+    const REAL_RUN_WRONG: &str = r#"{
+        "state": "SUCCESS",
+        "status_code": 10,
+        "status_msg": "Accepted",
+        "run_success": true,
+        "compare_result": "0",
+        "total_correct": 0,
+        "total_testcases": 1,
+        "code_answer": ["[1,2]", ""],
+        "expected_code_answer": ["[0,1]", ""],
+        "code_output": [],
+        "expected_code_output": []
+    }"#;
+
+    #[test]
+    fn a_sample_run_with_a_wrong_answer_is_not_accepted() {
+        let result: JudgeResult = serde_json::from_str(REAL_RUN_WRONG).unwrap();
+        assert!(
+            result.is_finished(),
+            "the run finished even though it was wrong"
+        );
+        assert_eq!(
+            result.verdict(),
+            Verdict::WrongAnswer,
+            "status_msg says Accepted, but compare_result says the case failed"
+        );
+        assert_eq!(result.summary(), "Wrong Answer · 0/1 tests");
+        assert_eq!(result.output_text().as_deref(), Some("[1,2]"));
+        assert_eq!(result.expected_text().as_deref(), Some("[0,1]"));
+    }
+
+    #[test]
+    fn a_sample_run_where_every_case_passes_is_accepted() {
+        let result: JudgeResult = serde_json::from_str(REAL_RUN_ACCEPTED).unwrap();
+        assert_eq!(result.verdict(), Verdict::Accepted);
+    }
+
+    #[test]
+    fn a_partially_passing_run_is_a_wrong_answer() {
+        let mut result: JudgeResult = serde_json::from_str(REAL_RUN_ACCEPTED).unwrap();
+        result.compare_result = Some("101".into());
+        assert_eq!(result.verdict(), Verdict::WrongAnswer);
+    }
+
+    #[test]
+    fn a_runtime_error_in_a_sample_run_is_still_a_runtime_error() {
+        // The downgrade must only ever turn Accepted into WrongAnswer; it must
+        // not mask a genuine execution failure.
+        let raw = r#"{"state":"SUCCESS","status_msg":"Runtime Error","status_code":14,
+            "run_success":false,"compare_result":"0","runtime_error":"IndexError"}"#;
+        let result: JudgeResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.verdict(), Verdict::RuntimeError);
+    }
+
+    #[test]
+    fn submissions_are_unaffected_by_the_compare_result_rule() {
+        // A real submission has no compare_result, and its status_msg is
+        // authoritative.
+        let raw = r#"{"state":"SUCCESS","status_msg":"Accepted","status_code":10}"#;
+        let result: JudgeResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(result.verdict(), Verdict::Accepted);
     }
 
     #[test]

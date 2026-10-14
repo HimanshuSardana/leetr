@@ -203,3 +203,129 @@ fn problem_list_pane_renders_real_content() {
 
     assert_eq!(state.matching(&page.problems).len(), page.problems.len());
 }
+
+// ---------------------------------------------------------------------------
+// The judge, against the real judge
+// ---------------------------------------------------------------------------
+//
+// These use `interpret_solution` ("Run Code"), which executes the code against
+// the sample test case and does **not** create a submission, so they can run
+// without spending an attempt. That matters: the guard exists precisely so
+// testing never consumes an attempt on an unsolved problem.
+//
+// This coverage previously did not exist at all — the judge was only tested
+// against hand-written fixtures, and one of those fixtures asserted
+// `code_output` was a string when the live API returns an array for sample
+// runs. That is the bug live coverage would have caught immediately.
+
+/// Client for the authenticated judge tests, or `None` to skip.
+fn authenticated_client() -> Option<LeetCodeClient> {
+    let credentials = Credentials::load();
+    if !credentials.is_configured() {
+        eprintln!(
+            "skipping: no credentials at {}",
+            leetr::config::credentials_path().display()
+        );
+        return None;
+    }
+    Some(LeetCodeClient::new(credentials).expect("client"))
+}
+
+/// A correct Python3 `two-sum`, verified against the judge.
+const TWO_SUM_CORRECT: &str = r#"class Solution:
+    def twoSum(self, nums, target):
+        seen = {}
+        for i, n in enumerate(nums):
+            if target - n in seen:
+                return [seen[target - n], i]
+            seen[n] = i
+"#;
+
+/// Deliberately wrong, to exercise the non-Accepted path.
+const TWO_SUM_WRONG: &str = r#"class Solution:
+    def twoSum(self, nums, target):
+        return [1, 2]
+"#;
+
+#[test]
+#[ignore = "hits the live LeetCode API"]
+fn sample_run_reports_accepted_for_correct_code() {
+    let Some(client) = authenticated_client() else {
+        return;
+    };
+
+    let id = client
+        .run_sample("two-sum", "1", "python3", TWO_SUM_CORRECT, "[2,7,11,15]\n9")
+        .expect("queue the sample run");
+    eprintln!("interpret_id: {id}");
+
+    let result = client.wait_for_submission(&id).expect("poll the run");
+    eprintln!(
+        "verdict: {:?}  summary: {}",
+        result.verdict(),
+        result.summary()
+    );
+
+    assert!(result.is_finished(), "the judge never finished: {result:?}");
+    assert_eq!(
+        result.verdict(),
+        leetr::leetcode::Verdict::Accepted,
+        "correct code should be Accepted, got {}",
+        result.summary()
+    );
+    assert_eq!(
+        result.total_testcases,
+        Some(1),
+        "a sample run executes the sample case"
+    );
+    assert!(
+        result.runtime_text().is_some(),
+        "a finished run should report a runtime: {result:?}"
+    );
+    // `interpret_solution` is "Run Code" and must not appear in the submission
+    // history — that is what makes it safe to exercise the judge while testing.
+    eprintln!("no submission should be added for this run; it used interpret_solution");
+}
+
+#[test]
+#[ignore = "hits the live LeetCode API"]
+fn sample_run_reports_wrong_answer_for_wrong_code() {
+    let Some(client) = authenticated_client() else {
+        return;
+    };
+
+    let id = client
+        .run_sample("two-sum", "1", "python3", TWO_SUM_WRONG, "[2,7,11,15]\n9")
+        .expect("queue the sample run");
+    let result = client.wait_for_submission(&id).expect("poll the run");
+    eprintln!(
+        "verdict: {:?}  summary: {}",
+        result.verdict(),
+        result.summary()
+    );
+
+    assert_eq!(
+        result.verdict(),
+        leetr::leetcode::Verdict::WrongAnswer,
+        "wrong code should be Wrong Answer, got {}",
+        result.summary()
+    );
+    assert!(
+        result.output_text().is_some(),
+        "a wrong answer should expose what the code produced: {result:?}"
+    );
+    assert!(
+        result.expected_text().is_some(),
+        "a wrong answer should expose what was expected: {result:?}"
+    );
+    // These arrive as arrays of per-case outputs for a sample run ("[1,2]"
+    // plus a trailing empty entry) and the helper must join them. Asserting the
+    // exact value is stronger than "looks flattened": the original hand-written
+    // fixture typed them as plain strings, which the live API is not.
+    assert_eq!(
+        result.output_text().as_deref(),
+        Some("[1,2]"),
+        "the produced answer should be surfaced verbatim"
+    );
+    assert_eq!(result.expected_text().as_deref(), Some("[0,1]"));
+}
