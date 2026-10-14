@@ -1,0 +1,74 @@
+name: Live API
+
+# The unit suite is fully offline, so it can never notice that LeetCode changed
+# its schema. That has bitten this project twice already (the solved-status enum
+# went from SOLVED to AC, and `problemsetQuestionList` silently started capping
+# `limit` at 100). These tests exercise the real API, and this schedule is what
+# turns "live tests exist" into "live tests actually run".
+on:
+  schedule:
+    # Nightly, at an off-peak minute to avoid the top-of-the-hour rush.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: live-api
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  live:
+    name: live LeetCode API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libwayland-dev \
+            libgl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Runs against the real leetcode.com. The authenticated test skips itself
+      # when credentials are absent (see `Credentials::load_from`, which ignores
+      # empty values), so this job is green without secrets and simply covers
+      # more when they are set.
+      #
+      # To also verify the solved-set lookup and the judge, add the cookies from
+      # a logged-in session as repository secrets:
+      #   LEETCODE_SESSION   the LEETCODE_SESSION cookie
+      #   LEETCODE_CSRFTOKEN the csrftoken cookie
+      # Note these expire, and an expired session makes the authenticated test
+      # fail rather than skip - which is the point: it tells you to refresh them.
+      - name: Live API tests
+        env:
+          LEETCODE_SESSION: ${{ secrets.LEETCODE_SESSION }}
+          LEETCODE_CSRFTOKEN: ${{ secrets.LEETCODE_CSRFTOKEN }}
+        run: cargo test --test live_api -- --ignored --test-threads=1 --nocapture
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Live API run"
+            echo
+            echo "Unofficial, undocumented endpoints — a failure here means LeetCode"
+            echo "changed something, not that the code regressed."
+          } >> "$GITHUB_STEP_SUMMARY"

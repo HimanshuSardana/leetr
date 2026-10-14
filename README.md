@@ -234,6 +234,13 @@ CI runs on every push and PR:
 * an **`msrv` job** that reads `rust-version` straight out of `Cargo.toml` and builds with
   exactly that toolchain, so the declared minimum is verified rather than asserted.
 
+Separately, a **nightly** workflow runs the live tests against the real LeetCode API. The
+offline suite cannot notice that an undocumented endpoint changed, and that has already
+happened twice here — the solved-status filter enum went from `SOLVED` to `AC`, and
+`problemsetQuestionList` silently started capping `limit` at 100. The nightly run needs no
+credentials; add `LEETCODE_SESSION` and `LEETCODE_CSRFTOKEN` as repository secrets to also
+cover the authenticated solved-set lookup.
+
 The live tests cover paging, search, statement fetching, the language list, the
 authenticated solved-set lookup, and headless rendering of the real statement and problem
 list panes. The judge client is tested against a mock judge over real HTTP (headers, CSRF,
