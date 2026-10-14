@@ -122,6 +122,29 @@ fn resolve_palette_choice(state: &mut PaletteState, outcome: &PaletteOutcome) ->
     outcome.chosen
 }
 
+/// Which auth badge to show.
+///
+/// The three "not signed in" cases are genuinely different, and conflating them
+/// produced a status bar reading "browse-only | Signed in as (unknown)" with a
+/// tooltip telling the user to add credentials they already had.
+fn auth_badge_for(
+    user: Option<&UserStatus>,
+    credentials_configured: bool,
+    solved: usize,
+) -> AuthBadge {
+    match user {
+        Some(status) if status.signed_in => AuthBadge::SignedIn {
+            username: status.username.clone(),
+            solved,
+        },
+        // Checked, and LeetCode refused us.
+        Some(_) => AuthBadge::Rejected,
+        // Not checked yet.
+        None if credentials_configured => AuthBadge::Checking,
+        None => AuthBadge::BrowseOnly,
+    }
+}
+
 /// Should a plain `Tab` switch from the statement pane to the code pane?
 ///
 /// Tab is the standard "move focus" key, so it only doubles as a pane switch
@@ -486,13 +509,24 @@ impl LeetrApp {
                 },
                 ApiEvent::Session(result) => match result {
                     Ok((status, solved)) => {
-                        self.status = format!(
-                            "Signed in as {} — {} solved",
-                            status.display_name(),
-                            solved.len()
-                        );
+                        if status.signed_in {
+                            self.status = format!(
+                                "Signed in as {} — {} solved",
+                                status.display_name(),
+                                solved.len()
+                            );
+                            self.solved = solved;
+                        } else {
+                            // Do not claim to be signed in when we are not: an
+                            // expired cookie reported "Signed in as (unknown)".
+                            self.status = "credentials rejected — the session has probably \
+                                expired; refresh it in ~/.config/leetr/credentials.toml"
+                                .to_string();
+                            self.solved.clear();
+                        }
+                        // `Some(_)` with `signed_in == false` means "checked and
+                        // refused", which the badge renders distinctly.
                         self.user = Some(status);
-                        self.solved = solved;
                     }
                     Err(err) => {
                         self.error = Some(format!("session check failed: {err}"));
@@ -503,13 +537,11 @@ impl LeetrApp {
     }
 
     fn auth_badge(&self) -> AuthBadge {
-        match &self.user {
-            Some(user) if user.signed_in => AuthBadge::SignedIn {
-                username: user.username.clone(),
-                solved: self.solved.len(),
-            },
-            _ => AuthBadge::BrowseOnly,
-        }
+        auth_badge_for(
+            self.user.as_ref(),
+            self.credentials.is_configured(),
+            self.solved.len(),
+        )
     }
 
     // -- workspace / editor --------------------------------------------------
@@ -1529,6 +1561,45 @@ mod tests {
             None
         );
         assert!(state.is_open(), "typing must not close the palette");
+    }
+
+    #[test]
+    fn an_expired_session_is_not_reported_as_signed_in() {
+        let refused = UserStatus {
+            signed_in: false,
+            username: String::new(),
+            premium: false,
+        };
+        // Credentials present, session refused -> Rejected, NOT BrowseOnly
+        // ("no credentials found") and emphatically not SignedIn.
+        assert_eq!(auth_badge_for(Some(&refused), true, 0), AuthBadge::Rejected);
+    }
+
+    #[test]
+    fn the_auth_badge_distinguishes_every_state() {
+        let ok = UserStatus {
+            signed_in: true,
+            username: "alice".into(),
+            premium: false,
+        };
+        let refused = UserStatus {
+            signed_in: false,
+            username: String::new(),
+            premium: false,
+        };
+
+        assert_eq!(
+            auth_badge_for(Some(&ok), true, 42),
+            AuthBadge::SignedIn {
+                username: "alice".into(),
+                solved: 42
+            }
+        );
+        assert_eq!(auth_badge_for(Some(&refused), true, 0), AuthBadge::Rejected);
+        // Configured but not yet checked is its own state: saying "browse-only"
+        // here would again tell the user to add credentials they have.
+        assert_eq!(auth_badge_for(None, true, 0), AuthBadge::Checking);
+        assert_eq!(auth_badge_for(None, false, 0), AuthBadge::BrowseOnly);
     }
 
     #[test]

@@ -9,7 +9,13 @@ use crate::theme;
 pub enum AuthBadge {
     /// Credentials are configured and LeetCode accepted them.
     SignedIn { username: String, solved: usize },
-    /// Either no credentials, or they have not been verified yet.
+    /// Credentials are configured but LeetCode *refused* the session — almost
+    /// always an expired cookie. Worth its own state: telling someone who has
+    /// credentials that none were found sends them to fix the wrong thing.
+    Rejected,
+    /// Credentials are configured and the check is still in flight.
+    Checking,
+    /// No credentials at all.
     #[default]
     BrowseOnly,
 }
@@ -36,6 +42,21 @@ pub fn show(
                         .weak()
                         .small(),
                 );
+            }
+            AuthBadge::Rejected => {
+                ui.label(
+                    egui::RichText::new(format!("{} session rejected", glyphs::DOT))
+                        .color(theme::DANGER),
+                )
+                .on_hover_text(
+                    "Your credentials were refused, so the cookies have probably expired. \
+                     Refresh LEETCODE_SESSION and csrftoken in \
+                     ~/.config/leetr/credentials.toml. Browsing and reading still work; \
+                     running and submitting will not.",
+                );
+            }
+            AuthBadge::Checking => {
+                ui.label(egui::RichText::new("checking session…").weak().small());
             }
             AuthBadge::BrowseOnly => {
                 ui.label(
