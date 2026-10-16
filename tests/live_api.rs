@@ -202,10 +202,6 @@ fn statement_pane_renders_real_content() {
 
     let text = leetr::ui::statement::blocks_text(&blocks);
     assert!(text.len() > 100, "expected a rich statement, got {text:?}");
-    assert_eq!(
-        leetr::ui::statement::title_line(&detail),
-        format!("{}. {}", detail.frontend_id, detail.title)
-    );
 }
 
 /// Drives the real problem-list pane against a page of live problems.

@@ -16,12 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::base::Selectable;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
-use gpui_kit::component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenuItem, SidebarToggleButton,
-};
+use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon};
 // The complete Lucide catalog ships with the assets crate; the component's own
 // `IconName` is only the small legacy subset.
@@ -29,13 +28,13 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab as KitTab, TabBar};
 use gpui_kit::component::theme::Theme as KitTheme;
-use gpui_kit::component::IndexPath;
+use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::Focusable;
 use gpui_kit::{
-    div, img, px, rgb, AnyElement, App, ClickEvent, Context, Entity, FontWeight, IntoElement,
-    KeyBinding, ObjectFit, Render, SharedString, Subscription, TitlebarOptions, Window,
-    WindowOptions,
+    div, img, px, rgb, AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Font, FontStyle,
+    FontWeight, Hsla, IntoElement, KeyBinding, ObjectFit, Render, SharedString, StyledText,
+    Subscription, TextRun, TitlebarOptions, Window, WindowOptions,
 };
 
 use crate::bg::Bg;
@@ -67,6 +66,12 @@ gpui_kit::actions!(
         RunTests,
         SubmitSolution,
         ToggleSidebar,
+        ShowStatementTab,
+        ShowCodeTab,
+        FocusSidebar,
+        SidebarNext,
+        SidebarPrev,
+        SidebarOpen,
     ]
 );
 
@@ -102,6 +107,12 @@ pub enum Tab {
     Statement,
     Code,
 }
+
+/// Key context set by the sidebar's focus target.
+///
+/// Bindings for j / k / Enter match against it, so they only apply while the
+/// sidebar itself has focus.
+const SIDEBAR_CONTEXT: &str = "LeetrSidebar && !Input";
 
 /// Which command palette is open. [`Command`] owns the query, the filter and
 /// the highlight; the view supplies ranked rows and applies choices.
@@ -405,6 +416,13 @@ pub struct LeetrView {
     quit_requested: bool,
     /// The problem sidebar is hidden.
     sidebar_collapsed: bool,
+    /// Focus target for keyboard browsing of the problem list.
+    sidebar_focus: FocusHandle,
+    /// Highlighted row within the sidebar's visible rows, moved by j / k.
+    sidebar_cursor: Option<usize>,
+    /// Alt+S was pressed; focusing needs a window, so it happens on the next
+    /// paint.
+    pending_sidebar_focus: bool,
 }
 
 impl LeetrView {
@@ -416,6 +434,8 @@ impl LeetrView {
         code_input: Entity<EditorState>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let sidebar_focus = cx.focus_handle();
+
         // Keep the search field and the filter model in sync.
         let search_sub = cx.subscribe(
             &search_input,
@@ -505,6 +525,9 @@ impl LeetrView {
             code_input_needs_sync: None,
             quit_requested: false,
             sidebar_collapsed: false,
+            sidebar_focus,
+            sidebar_cursor: None,
+            pending_sidebar_focus: false,
         };
 
         view.refresh_session();
@@ -1147,6 +1170,64 @@ impl LeetrView {
     }
 
     /// One confirmed command-palette row.
+    /// Problems the sidebar is currently listing, in display order.
+    fn visible_problem_indices(&self) -> Vec<usize> {
+        let mut rows = self.list_state.matching(&self.problems);
+        rows.truncate(rows.len().min(self.row_cap));
+        rows
+    }
+
+    /// Row of the open problem, so Alt+S starts where the reader is.
+    fn cursor_row_for_current_problem(&self) -> usize {
+        let rows = self.visible_problem_indices();
+        self.selected
+            .as_deref()
+            .and_then(|slug| {
+                rows.iter()
+                    .position(|&index| self.problems[index].slug == slug)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Move the sidebar cursor, clamped at both ends rather than wrapping.
+    fn move_sidebar_cursor(&mut self, forward: bool) {
+        let count = self.visible_problem_indices().len();
+        if count == 0 {
+            self.sidebar_cursor = None;
+            return;
+        }
+        let current = self.sidebar_cursor.unwrap_or(0).min(count - 1);
+        self.sidebar_cursor = Some(if forward {
+            (current + 1).min(count - 1)
+        } else {
+            current.saturating_sub(1)
+        });
+    }
+
+    /// Open the problem under the sidebar cursor.
+    fn open_sidebar_cursor(&mut self) {
+        let rows = self.visible_problem_indices();
+        if let Some(&index) = self.sidebar_cursor.and_then(|cursor| rows.get(cursor)) {
+            let slug = self.problems[index].slug.clone();
+            self.open_problem(slug);
+        }
+    }
+
+    /// Search LeetCode for whatever is typed in the problem palette.
+    ///
+    /// The same thing the palette's fallback row does, reachable without
+    /// hunting for that row — and the row only exists when the local list came
+    /// up empty, so a query that matched something locally had no way to reach
+    /// the server at all.
+    fn search_typed_query(&mut self, cx: &mut App) {
+        let query = self.problems_cmd.read(cx).query(cx).to_string();
+        if query.trim().is_empty() {
+            return;
+        }
+        self.close_palette();
+        self.search_problems(query);
+    }
+
     fn confirm_palette(
         &mut self,
         kind: PaletteKind,
@@ -1156,7 +1237,8 @@ impl LeetrView {
     ) {
         match kind {
             PaletteKind::Actions => {
-                let groups = self.action_groups();
+                let query = self.actions_cmd.read(cx).query(cx).to_string();
+                let groups = self.action_groups(&query);
                 let action = groups
                     .get(path.section)
                     .and_then(|(_, rows)| rows.get(path.row))
@@ -1249,15 +1331,44 @@ impl LeetrView {
     }
 
     /// Action rows grouped by section, in catalog order.
-    fn action_groups(&self) -> Vec<(String, Vec<(Action, String)>)> {
-        let mut groups: Vec<(String, Vec<(Action, String)>)> = Vec::new();
-        for (action, hint, section, _) in self.action_catalog() {
-            match groups.last_mut() {
-                Some((name, rows)) if name == section => rows.push((action, hint)),
-                _ => groups.push((section.to_string(), vec![(action, hint)])),
+    /// Action rows matching `query`, grouped by section for browsing and flat
+    /// when ranked.
+    ///
+    /// The palette runs with the component's own filtering off (`.filterable(false)`)
+    /// so that ranking stays fuzzy — which means the rows have to be filtered
+    /// here, on every render, or typing in the field would do nothing.
+    fn action_groups(&self, query: &str) -> Vec<(String, Vec<(Action, String)>)> {
+        let catalog = self.action_catalog();
+        let entries: Vec<PaletteEntry> = catalog
+            .iter()
+            .map(|(action, hint, section, _)| {
+                PaletteEntry::new(action.search_label())
+                    .with_hint(hint.clone())
+                    .with_section(*section)
+            })
+            .collect();
+        let matches = palette::visible_matches(query, &entries, None);
+
+        if query.trim().is_empty() {
+            let mut groups: Vec<(String, Vec<(Action, String)>)> = Vec::new();
+            for index in matches {
+                let (action, hint, section, _) = &catalog[index];
+                match groups.last_mut() {
+                    Some((name, rows)) if name == *section => rows.push((*action, hint.clone())),
+                    _ => groups.push((section.to_string(), vec![(*action, hint.clone())])),
+                }
             }
+            groups
+        } else {
+            let rows = matches
+                .into_iter()
+                .map(|index| {
+                    let (action, hint, _, _) = &catalog[index];
+                    (*action, hint.clone())
+                })
+                .collect();
+            vec![("Commands".to_string(), rows)]
         }
-        groups
     }
 
     /// Problem rows matching `query`/`chip`, grouped by status for browsing
@@ -1422,71 +1533,21 @@ impl LeetrView {
             .text_color(rgb(theme::difficulty_hex(difficulty)))
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&mut self, cx: &mut Context<Self>, focused: bool) -> AnyElement {
         let matching = self.list_state.matching(&self.problems);
         let shown = matching.len().min(self.row_cap);
-        let badge = self.auth_badge();
-        let (session_text, session_color) = session_line(&badge);
-        let theme_label = self.config.theme.label().to_string();
-        let theme_icon = self.config.theme.icon().to_string();
         let view = cx.entity();
 
-        // ---- header: brand, session, quick actions, search ----
-        let toggle_view = view.clone();
+        // ---- header: just the filter field ----
+        //
+        // The brand, the session line, the theme button and the quick-actions
+        // button used to live here. The sidebar is a list now: identity and
+        // theme are in the status bar and the command palette.
         let header = div()
             .flex()
             .flex_col()
             .w_full()
             .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_lg().font_weight(FontWeight::BOLD).child("leetr"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1()
-                            .child(
-                                SidebarToggleButton::new()
-                                    .collapsed(self.sidebar_collapsed)
-                                    .accessibility_label("Toggle sidebar")
-                                    .on_click(move |_, window, cx| {
-                                        toggle_view.update(cx, |this, _| {
-                                            this.sidebar_collapsed = !this.sidebar_collapsed;
-                                        });
-                                        window.refresh();
-                                    }),
-                            )
-                            .child(
-                                Button::new("theme-toggle")
-                                    .label(format!("{theme_icon} {theme_label}"))
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.toggle_theme(cx);
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(match session_color {
-                        Some(hex) => rgb(hex),
-                        None => rgb(MUTED_DARK),
-                    })
-                    .child(session_text),
-            )
-            .child(
-                Button::new("quick-actions")
-                    .label("Quick actions  ⌘K")
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.open_actions_palette(window, cx);
-                    })),
-            )
             .child(Input::new(&self.search_input).id("problem-search"));
 
         // ---- "Filter" group: status, level, premium ----
@@ -1608,25 +1669,26 @@ impl LeetrView {
 
         // ---- "Problems" group ----
         let mut problem_items = Vec::new();
-        for &index in matching.iter().take(shown) {
+        let cursor = self.sidebar_cursor.filter(|_| focused);
+        for (position, &index) in matching.iter().take(shown).enumerate() {
             let problem = &self.problems[index];
             let slug = problem.slug.clone();
-            let active = self.selected.as_deref() == Some(slug.as_str());
+            // With the sidebar focused the highlight follows the cursor;
+            // otherwise it marks the problem that is open.
+            let active = if cursor.is_some() {
+                cursor == Some(position)
+            } else {
+                self.selected.as_deref() == Some(slug.as_str())
+            };
             let label = format!("{}. {}", problem.id, problem.title);
-            let diff_label = problem.difficulty.label().to_string();
-            let diff_hex = theme::difficulty_hex(problem.difficulty);
             let icon = Self::status_icon(problem.status, problem.difficulty);
             let item_view = view.clone();
+            // The dot's colour already says easy/medium/hard, so the row
+            // carries no difficulty text.
             problem_items.push(
                 SidebarMenuItem::new(label)
                     .icon(icon)
                     .active(active)
-                    .suffix(move |_, _| {
-                        div()
-                            .text_xs()
-                            .text_color(rgb(diff_hex))
-                            .child(diff_label.clone())
-                    })
                     .on_click(move |_, window, cx| {
                         let slug = slug.clone();
                         item_view.update(cx, |this, _| this.open_problem(slug));
@@ -1704,7 +1766,12 @@ impl LeetrView {
         }
 
         // ---- footer: counts ----
-        let footer = if self.list_loading {
+        let footer = if focused {
+            div()
+                .text_xs()
+                .text_color(rgb(MUTED_DARK))
+                .child("j / k move · Enter opens")
+        } else if self.list_loading {
             div()
                 .flex()
                 .flex_row()
@@ -1757,7 +1824,16 @@ impl LeetrView {
             sidebar = sidebar.child(SidebarGroup::new("Current problem").children(current_items));
         }
         sidebar = sidebar.child(SidebarGroup::new("App").children(app_items));
-        sidebar.footer(footer).into_any_element()
+        // The wrapper is the focus target: it carries the key context the j / k
+        // / Enter bindings match against, and it is what Alt+S focuses.
+        div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .track_focus(&self.sidebar_focus)
+            .key_context("LeetrSidebar")
+            .child(sidebar.footer(footer))
+            .into_any_element()
     }
 
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1780,11 +1856,39 @@ impl LeetrView {
                 .into_any_element();
         };
 
-        // The underline variant: children inherit it from the bar, and the
-        // active pane is marked by the sliding underline rather than a filled
-        // pill, which keeps the statement/code switch visually quiet.
+        // The collapse control is the tab bar's prefix rather than a sibling, so
+        // it sits inside the bar's background and stays reachable with the
+        // sidebar hidden. It is a plain button rather than
+        // `SidebarToggleButton` so its surface can be set explicitly: in dark
+        // mode it reads as a black tile against the bar.
+        let toggle_view = cx.entity();
+        let toggle_icon = if self.sidebar_collapsed {
+            IconName::PanelLeftOpen
+        } else {
+            IconName::PanelLeftClose
+        };
+        let toggle_surface = if cx.theme().is_dark() {
+            rgb(0x000000).into()
+        } else {
+            gpui_kit::transparent_black()
+        };
+        let sidebar_toggle = Button::new("sidebar-toggle")
+            .ghost()
+            .small()
+            .bg(toggle_surface)
+            .icon(Icon::new(toggle_icon).size_4())
+            .accessibility_label("Toggle sidebar")
+            .on_click(move |_, window, cx| {
+                toggle_view.update(cx, |this, _| {
+                    this.sidebar_collapsed = !this.sidebar_collapsed;
+                });
+                window.refresh();
+            });
+
         let tabs = TabBar::new("leetr-tabs")
-            .underline()
+            .w_full()
+            .py_1()
+            .prefix(sidebar_toggle)
             .selected_index(match self.tab {
                 Tab::Statement => 0,
                 Tab::Code => 1,
@@ -1810,45 +1914,45 @@ impl LeetrView {
 
         let tab = self.tab;
         let pane = match tab {
-            Tab::Statement => self.render_statement(&detail),
+            Tab::Statement => self.render_statement(&detail, cx),
             Tab::Code => self.render_code(cx),
         };
 
+        // The tab bar is flush with the pane's edges — no outer padding or
+        // gap — so its background spans the full width. The padding belongs to
+        // the content underneath it.
         div()
             .flex()
             .flex_col()
             .flex_1()
             .h_full()
-            .p_3()
-            .gap_2()
             .child(tabs)
-            .child(pane)
+            .child(div().flex().flex_col().flex_1().p_3().gap_2().child(pane))
             .into_any_element()
     }
 
-    fn render_statement(&self, detail: &QuestionDetail) -> AnyElement {
+    fn render_statement(&self, detail: &QuestionDetail, cx: &Context<Self>) -> AnyElement {
+        // Code blocks in a statement are drawn by hand, so they have to take
+        // their colours from the theme. They used to hard-code a dark surface
+        // and inherited the foreground, which made them dark-on-dark in light
+        // mode.
+        let style = StatementStyle {
+            fg: cx.theme().foreground,
+            code_fg: rgb(theme::ACCENT_HEX).into(),
+            // `muted` is a surface, so it reads correctly in both themes.
+            code_bg: cx.theme().muted,
+            ui_family: cx.theme().font_family.clone(),
+            mono_family: cx.theme().mono_font_family.clone(),
+        };
         let header = div()
             .flex()
             .flex_col()
             .gap_1()
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_baseline()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED_DARK))
-                            .child(detail.frontend_id.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .child(detail.title.clone()),
-                    ),
+                    .text_lg()
+                    .font_weight(FontWeight::BOLD)
+                    .child(detail.title.clone()),
             )
             .child(
                 div()
@@ -1897,7 +2001,7 @@ impl LeetrView {
             );
         } else {
             for (index, block) in self.detail_blocks.iter().enumerate() {
-                body = body.child(render_block(block, index));
+                body = body.child(render_block(block, index, &style));
             }
             if !detail.hints.is_empty() {
                 body = body.child(
@@ -1931,27 +2035,54 @@ impl LeetrView {
                 .into_any_element();
         };
 
+        // The problem's snippet list can run to a dozen languages, which as a
+        // row of buttons wrapped onto extra lines. It is a dropdown now.
+        // The trigger's own caret is supplied by `DropdownButton`; asking the
+        // inner `Button` for one as well drew two.
+        let current_slug = buffer.lang_slug.clone();
+        let current = self
+            .languages
+            .iter()
+            .find(|choice| choice.slug == current_slug)
+            .map(|choice| choice.label.clone())
+            .unwrap_or_else(|| current_slug.clone());
+        let choices = self.languages.clone();
+        let menu_view = cx.entity();
+        let language_picker = DropdownButton::new("language-picker")
+            .button(Button::new("language-picker-button").label(current))
+            .dropdown_menu(move |menu, _window, _cx| {
+                let mut menu = menu;
+                for choice in &choices {
+                    // Ticks the language the editor is actually using — the
+                    // first version compared a value with itself and so ticked
+                    // every row.
+                    let selected = choice.slug == current_slug;
+                    let slug = choice.slug.clone();
+                    let view = menu_view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label.clone())
+                            .checked(selected)
+                            .on_click(move |_, _window, cx| {
+                                let slug = slug.clone();
+                                view.update(cx, |this, _| this.switch_language(slug));
+                            }),
+                    );
+                }
+                menu
+            });
+
         let lang_row = div()
             .flex()
             .flex_row()
-            .gap_1()
-            .children(self.languages.iter().map(|choice| {
-                let slug = choice.slug.clone();
-                let active = buffer.lang_slug == slug;
-                Button::new(SharedString::from(format!("lang-{slug}")))
-                    .label(choice.label.clone())
-                    .toggled(active)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.switch_language(slug.clone());
-                        cx.notify();
-                    }))
-            }));
+            .items_center()
+            .gap_2()
+            .child(language_picker);
 
         let judge = match self.judge.clone() {
             None => div()
                 .text_xs()
                 .text_color(rgb(MUTED_DARK))
-                .child("Run the sample tests, or submit when you are confident.")
+                .child("Ctrl+' runs the sample tests · Ctrl+Enter submits · Ctrl+O opens nvim")
                 .into_any_element(),
             Some(view) => render_judge(&view),
         };
@@ -1972,57 +2103,14 @@ impl LeetrView {
                     .overflow_hidden()
                     .child(Editor::new(&self.code_input).size_full()),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(
-                        Button::new("run-tests")
-                            .label("Run tests")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.start_judge(false);
-                                cx.notify();
-                            })),
-                    )
-                    .child(Button::new("submit").label("Submit").on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            this.start_judge(true);
-                            cx.notify();
-                        },
-                    )))
-                    .child(
-                        Button::new("open-nvim")
-                            .label("Open in nvim")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.open_in_nvim();
-                                cx.notify();
-                            })),
-                    ),
-            )
             .child(judge)
             .into_any_element()
     }
 
     fn render_status_bar(&self) -> AnyElement {
-        let badge = self.auth_badge();
-        let badge_text = match &badge {
-            AuthBadge::SignedIn { username, solved } if username.is_empty() => {
-                format!("{} signed in · {solved} solved", crate::glyphs::DOT)
-            }
-            AuthBadge::SignedIn { username, solved } => {
-                format!("{} {username} · {solved} solved", crate::glyphs::DOT)
-            }
-            AuthBadge::Rejected => format!("{} session rejected", crate::glyphs::DOT),
-            AuthBadge::Checking => "checking session…".to_string(),
-            AuthBadge::BrowseOnly => format!("{} browse-only", crate::glyphs::DOT),
-        };
-        let badge_color = match &badge {
-            AuthBadge::SignedIn { .. } => theme::SUCCESS_HEX,
-            AuthBadge::Rejected => theme::DANGER_HEX,
-            AuthBadge::Checking => MUTED_DARK,
-            AuthBadge::BrowseOnly => theme::WARNING_HEX,
-        };
+        let (session_text, session_color) = session_line(&self.auth_badge());
+        let badge_text = format!("{} {session_text}", crate::glyphs::DOT);
+        let badge_color = session_color.unwrap_or(MUTED_DARK);
         let message = match self.error.as_deref() {
             Some(err) => err.to_string(),
             None => self.status.clone(),
@@ -2080,6 +2168,8 @@ impl LeetrView {
             PaletteKind::Actions => {
                 let cancel_view = view.clone();
                 let confirm_view = view.clone();
+                let query = self.actions_cmd.read(cx).query(cx).to_string();
+                let groups = self.action_groups(&query);
                 let mut command = Command::new(&self.actions_cmd)
                     .filterable(false)
                     .placeholder("Type a command…")
@@ -2096,7 +2186,7 @@ impl LeetrView {
                     });
                     window.refresh();
                 });
-                for (section, rows) in self.action_groups() {
+                for (section, rows) in groups {
                     let mut group = CommandGroup::new().label(section);
                     for (action, _) in rows {
                         group = group.item(CommandItem::new().label(action.search_label()));
@@ -2166,27 +2256,39 @@ impl LeetrView {
     }
 }
 
-fn render_block(block: &Block, index: usize) -> AnyElement {
+/// Everything the statement renderer needs from the active theme and font
+/// configuration, resolved once per frame.
+#[derive(Clone)]
+struct StatementStyle {
+    fg: Hsla,
+    code_fg: Hsla,
+    code_bg: Hsla,
+    ui_family: SharedString,
+    mono_family: SharedString,
+}
+
+fn render_block(block: &Block, index: usize, style: &StatementStyle) -> AnyElement {
     match block {
-        Block::Paragraph(spans) => render_spans(spans, false),
+        Block::Paragraph(spans) => render_spans(spans, style),
         Block::Heading(spans) => div()
             .text_lg()
             .font_weight(FontWeight::BOLD)
-            .child(render_spans(spans, false))
+            .child(render_spans(spans, style))
             .into_any_element(),
         Block::ListItem(spans) => div()
             .flex()
             .flex_row()
             .gap_2()
             .child(div().text_sm().child("•"))
-            .child(render_spans(spans, false))
+            .child(render_spans(spans, style))
             .into_any_element(),
         Block::Code(code) => div()
             .w_full()
             .rounded_md()
-            .bg(rgb(0x121417))
+            .bg(style.code_bg)
+            .text_color(style.fg)
             .p_2()
-            .child(div().text_xs().child(code.trim_end().to_string()))
+            .child(div().text_xs().child(clean_code(code).to_string()))
             .into_any_element(),
         Block::Image { alt, url } => render_image(alt, url, index),
         Block::Rule => div()
@@ -2283,29 +2385,74 @@ fn render_image(alt: &str, url: &str, index: usize) -> AnyElement {
         .into_any_element()
 }
 
-fn render_spans(spans: &[crate::leetcode::html::Span], _heading: bool) -> AnyElement {
+/// Strip the blank line LeetCode's HTML puts immediately after `<pre>`.
+///
+/// Only newlines are removed, never indentation: leading spaces are code.
+fn clean_code(code: &str) -> &str {
+    code.trim_start_matches(['\n', '\r']).trim_end()
+}
+
+/// One paragraph's inline run, as a single text flow.
+///
+/// This used to be a flex row of one element per span, which cannot share a
+/// baseline — inline code sat at a different height from the words around it,
+/// and lines broke between spans rather than between words. Runs on one
+/// `StyledText` give normal inline layout.
+fn render_spans(spans: &[crate::leetcode::html::Span], style: &StatementStyle) -> AnyElement {
+    let mut text = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+
+    for span in spans {
+        if span.text.is_empty() {
+            continue;
+        }
+        let bold = matches!(span.style, SpanStyle::Bold | SpanStyle::BoldItalic);
+        let italic = matches!(span.style, SpanStyle::Italic | SpanStyle::BoldItalic);
+        let code = matches!(span.style, SpanStyle::Code);
+
+        // A `TextRun` carries family, weight and colour but no size, so inline
+        // code is the same size as the prose and is told apart by its family
+        // and background instead.
+        let (family, color, background) = if code {
+            (
+                style.mono_family.clone(),
+                style.code_fg,
+                // Tinting inline code keeps it distinct without turning a
+                // sentence into a stripe.
+                Some(style.code_bg),
+            )
+        } else {
+            (style.ui_family.clone(), style.fg, None)
+        };
+
+        text.push_str(&span.text);
+        runs.push(TextRun {
+            len: span.text.len(),
+            font: Font {
+                family,
+                features: Default::default(),
+                fallbacks: None,
+                weight: if bold {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                },
+                style: if italic {
+                    FontStyle::Italic
+                } else {
+                    FontStyle::Normal
+                },
+            },
+            color,
+            background_color: background,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+
     div()
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .children(
-            spans
-                .iter()
-                .map(|span| {
-                    let mut text = div().text_sm().child(span.text.clone());
-                    match span.style {
-                        SpanStyle::Bold | SpanStyle::BoldItalic => {
-                            text = text.font_weight(FontWeight::BOLD);
-                        }
-                        SpanStyle::Code => {
-                            text = text.text_color(rgb(theme::ACCENT_HEX)).text_xs();
-                        }
-                        SpanStyle::Normal | SpanStyle::Italic => {}
-                    }
-                    text
-                })
-                .collect::<Vec<_>>(),
-        )
+        .text_sm()
+        .child(StyledText::new(text).with_runs(runs))
         .into_any_element()
 }
 
@@ -2387,6 +2534,20 @@ impl Render for LeetrView {
             });
         }
 
+        // Alt+S asked to drive the list from the keyboard; focusing needs the
+        // window, so it happens here.
+        if self.pending_sidebar_focus {
+            self.pending_sidebar_focus = false;
+            if self.sidebar_cursor.is_none() {
+                self.sidebar_cursor = Some(self.cursor_row_for_current_problem());
+            }
+            window.focus(&self.sidebar_focus, cx);
+        }
+        // Whether the sidebar holds focus is read from the window rather than
+        // mirrored in state, so clicking into the editor ends keyboard
+        // browsing with no bookkeeping.
+        let sidebar_focused = self.sidebar_focus.is_focused(window);
+
         // A global shortcut asked for a palette; focusing its field needs the
         // window, so it is applied here.
         if let Some(kind) = self.pending_palette.take() {
@@ -2407,9 +2568,10 @@ impl Render for LeetrView {
                     .flex()
                     .flex_row()
                     .flex_1()
-                    .when(!self.sidebar_collapsed, |row| {
-                        row.child(self.render_sidebar(cx))
-                    })
+                    // Always rendered: the component animates its own width
+                    // between the expanded panel and the icon rail, which only
+                    // works if it stays mounted while collapsed.
+                    .child(self.render_sidebar(cx, sidebar_focused))
                     .child(
                         div()
                             .flex()
@@ -2480,10 +2642,28 @@ fn bind_global_actions(cx: &mut App, view: &Entity<LeetrView>) {
     listener::<Quit>(cx, view, |_, cx| cx.quit());
     listener::<OpenInNvim>(cx, view, |this, _| this.open_in_nvim());
     listener::<RunTests>(cx, view, |this, _| this.start_judge(false));
-    listener::<SubmitSolution>(cx, view, |this, _| this.start_judge(true));
+    // Ctrl+Enter means "go": submit the solution normally, but run the typed
+    // query against LeetCode while the problem palette is open. One handler
+    // rather than two bindings for the same keystroke, which would be
+    // ambiguous.
+    listener::<SubmitSolution>(cx, view, |this, cx| {
+        if this.open_palette == Some(PaletteKind::Problems) {
+            this.search_typed_query(cx);
+        } else {
+            this.start_judge(true);
+        }
+    });
     listener::<ToggleSidebar>(cx, view, |this, _| {
         this.sidebar_collapsed = !this.sidebar_collapsed;
     });
+    // Focusing needs the window, which an action listener does not get, so the
+    // request is applied on the next paint.
+    listener::<FocusSidebar>(cx, view, |this, _| this.pending_sidebar_focus = true);
+    listener::<SidebarNext>(cx, view, |this, _| this.move_sidebar_cursor(true));
+    listener::<SidebarPrev>(cx, view, |this, _| this.move_sidebar_cursor(false));
+    listener::<SidebarOpen>(cx, view, |this, _| this.open_sidebar_cursor());
+    listener::<ShowStatementTab>(cx, view, |this, _| this.tab = Tab::Statement);
+    listener::<ShowCodeTab>(cx, view, |this, _| this.tab = Tab::Code);
 }
 
 /// Start the GPUI application.
@@ -2518,6 +2698,22 @@ pub fn run() -> anyhow::Result<()> {
             KeyBinding::new("ctrl-enter", SubmitSolution, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("escape", CloseOverlay, None),
+            // Alt+1 / Alt+2 switch panes. The plain digits are unusable: a
+            // binding without a modifier also matches while the code editor is
+            // focused (on Linux GPUI does not prefer character input over a
+            // binding), so typing "1" in a solution would jump to the
+            // statement. A context predicate cannot express "not in the
+            // editor" either — GPUI's `!Input` never matches an empty context
+            // stack, which is the state with nothing focused.
+            KeyBinding::new("alt-1", ShowStatementTab, None),
+            KeyBinding::new("alt-2", ShowCodeTab, None),
+            KeyBinding::new("alt-s", FocusSidebar, None),
+            // Only while the sidebar itself holds focus, and never while one of
+            // its fields does (`&& !Input`), so j and k stay ordinary
+            // characters in the filter box and in the editor.
+            KeyBinding::new("j", SidebarNext, Some(SIDEBAR_CONTEXT)),
+            KeyBinding::new("k", SidebarPrev, Some(SIDEBAR_CONTEXT)),
+            KeyBinding::new("enter", SidebarOpen, Some(SIDEBAR_CONTEXT)),
         ]);
 
         let options = WindowOptions {
