@@ -66,6 +66,8 @@ gpui_kit::actions!(
         RunTests,
         SubmitSolution,
         ToggleSidebar,
+        ShowStatementTab,
+        ShowCodeTab,
     ]
 );
 
@@ -2491,6 +2493,15 @@ pub fn run() -> anyhow::Result<()> {
             KeyBinding::new("ctrl-enter", SubmitSolution, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("escape", CloseOverlay, None),
+            // Alt+1 / Alt+2 switch panes. The plain digits are unusable: a
+            // binding without a modifier also matches while the code editor is
+            // focused (on Linux GPUI does not prefer character input over a
+            // binding), so typing "1" in a solution would jump to the
+            // statement. A context predicate cannot express "not in the
+            // editor" either — GPUI's `!Input` never matches an empty context
+            // stack, which is the state with nothing focused.
+            KeyBinding::new("alt-1", ShowStatementTab, None),
+            KeyBinding::new("alt-2", ShowCodeTab, None),
         ]);
 
         let options = WindowOptions {
