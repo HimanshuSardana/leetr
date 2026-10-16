@@ -2,22 +2,34 @@
 name = "leetr"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.95"
-description = "A lightweight egui LeetCode client with first-class nvim interoperability"
+# The MSRV is what the dependency graph actually demands, not a preference, and
+# CI builds with exactly this toolchain:
+#   * edition 2024 needs 1.85 (the gpui-pre crates use it),
+#   * `tree-sitter-language` declares 1.90,
+#   * `oo7` (secret-service, via gpui-pre-linux) declares 1.92, and
+#   * `gpui-pre-util` calls `<[T]>::as_array`, stabilized in 1.93.0.
+# So 1.92 is not enough despite being the highest *declared* floor, and GPUI
+# Kit's own installation guide ("Rust 1.92 or later") is optimistic.
+rust-version = "1.93"
+description = "A lightweight GPUI LeetCode client with first-class nvim interoperability"
 license = "MIT"
 repository = "https://github.com/HimanshuSardana/leetr"
 readme = "README.md"
-keywords = ["leetcode", "egui", "nvim", "cli"]
+keywords = ["leetcode", "gpui", "nvim", "cli"]
 categories = ["gui", "command-line-utilities"]
 
 [dependencies]
-eframe = { version = "0.36", default-features = false, features = [
-    "default_fonts",
-    "glow",
-    "wayland",
-    "x11",
+# Syntax highlighting in the solution editor comes from tree-sitter grammars,
+# which are compiled C and cost real binary size (~2 MB each), so only Python
+# and C++ are compiled in. Every other LeetCode language renders as plain text
+# — see `editor_language` in src/app.rs to change the set.
+gpui-kit = { version = "0.7.3", features = [
+    "tree-sitter-cpp",
+    "tree-sitter-python",
 ] }
-egui = "0.36"
+# `futures` is only for the image `HttpClient` bridge (a oneshot channel and a
+# boxed future); the app itself still runs no async runtime.
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

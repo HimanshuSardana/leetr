@@ -3,17 +3,18 @@
 //!
 //! The matching logic is a pure function so it can be tested exhaustively
 //! without an egui context.
+//!
+//! Visually it follows the "spotlight" convention: a borderless search field
+//! with a key cap on the right, a row of filter chips, small-caps section
+//! headers, and rows whose trailing edge carries either a shortcut key cap or a
+//! muted hint.
 
-use egui::{Color32, Key, RichText, TextEdit};
+//!
+//! Rendering lives in the GPUI views (`crate::app`): this module keeps the
+//! matching, ranking and open/close state so it stays unit-testable.
 
-/// Width of the palette popup.
-const PALETTE_WIDTH: f32 = 680.0;
-/// Height of the scrollable result list.
-const LIST_HEIGHT: f32 = 400.0;
 /// Upper bound on rendered rows, so a 4000-entry list stays instant.
-const MAX_ROWS: usize = 200;
-/// Height of one result row.
-const ROW_HEIGHT: f32 = 40.0;
+pub const MAX_ROWS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Fuzzy matching
@@ -112,21 +113,27 @@ pub fn rank<S: AsRef<str>>(query: &str, candidates: &[S]) -> Vec<usize> {
 // ---------------------------------------------------------------------------
 
 /// One selectable row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaletteEntry {
     pub label: String,
     /// Secondary text shown after the label (and searched too).
     pub hint: String,
     /// Optional glyph, drawn with the monospace font (see [`crate::glyphs`]).
     pub icon: Option<String>,
+    /// Group heading this row sits under. Consecutive rows sharing a section
+    /// are drawn beneath one small-caps header.
+    pub section: Option<String>,
+    /// Keyboard shortcut, drawn as a key cap on the right of the row.
+    pub shortcut: Option<String>,
+    /// Chip ids this row answers to (used by the filter chips).
+    pub tags: Vec<String>,
 }
 
 impl PaletteEntry {
     pub fn new(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
-            hint: String::new(),
-            icon: None,
+            ..Self::default()
         }
     }
 
@@ -140,6 +147,25 @@ impl PaletteEntry {
         self
     }
 
+    pub fn with_section(mut self, section: impl Into<String>) -> Self {
+        self.section = Some(section.into());
+        self
+    }
+
+    pub fn with_shortcut(mut self, shortcut: impl Into<String>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
+    }
+
+    pub fn with_tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags = tags.into_iter().map(Into::into).collect();
+        self
+    }
+
     fn search_text(&self) -> String {
         if self.hint.is_empty() {
             self.label.clone()
@@ -149,12 +175,45 @@ impl PaletteEntry {
     }
 }
 
+/// A filter chip drawn above the results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteChip {
+    pub id: String,
+    pub label: String,
+}
+
+impl PaletteChip {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// Everything the palette needs besides the entries themselves.
+#[derive(Debug, Clone, Default)]
+pub struct PaletteConfig<'a> {
+    /// Stable id (keeps the modal and its widgets apart per palette).
+    pub id: &'a str,
+    /// Placeholder shown in the empty search field.
+    pub placeholder: &'a str,
+    /// Key cap drawn at the right of the search field, e.g. `"Ctrl P"`.
+    pub search_badge: Option<&'a str>,
+    /// Filter chips shown between the search field and the results.
+    pub chips: Vec<PaletteChip>,
+    /// Fallback action offered when nothing matches (see `empty_action`).
+    pub empty_action: Option<&'a str>,
+}
+
 /// Open/closed state and cursor of one palette.
 #[derive(Debug, Default, Clone)]
 pub struct PaletteState {
     open: bool,
     query: String,
     selected: usize,
+    /// Active filter chip id; `None` means "All".
+    chip: Option<String>,
     /// Set for one frame after opening so the text field takes focus.
     grab_focus: bool,
     /// Set when the selection moved by keyboard so the list scrolls to it.
@@ -166,11 +225,12 @@ impl PaletteState {
         self.open
     }
 
-    /// Open with a clean query.
+    /// Open with a clean query and no chip filter.
     pub fn open(&mut self) {
         self.open = true;
         self.query.clear();
         self.selected = 0;
+        self.chip = None;
         self.grab_focus = true;
         self.scroll_to_selection = false;
     }
@@ -179,12 +239,18 @@ impl PaletteState {
         self.open = false;
         self.query.clear();
         self.selected = 0;
+        self.chip = None;
         self.grab_focus = false;
         self.scroll_to_selection = false;
     }
 
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// The active chip id, if any.
+    pub fn active_chip(&self) -> Option<&str> {
+        self.chip.as_deref()
     }
 }
 
@@ -198,301 +264,88 @@ pub struct PaletteOutcome {
     pub empty_action: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
-
-/// Draw the palette as a modal overlay. Returns the user's choice, if any.
-pub fn show(
-    ctx: &egui::Context,
-    state: &mut PaletteState,
-    id: &str,
-    placeholder: &str,
-    entries: &[PaletteEntry],
-    empty_action: Option<&str>,
-) -> PaletteOutcome {
-    if !state.open {
-        return PaletteOutcome::default();
+impl PaletteState {
+    /// Replace the query (GPUI input drives this) and reset the cursor.
+    pub fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.selected = 0;
     }
 
+    /// Activate a filter chip; `None` means "All".
+    pub fn set_chip(&mut self, chip: Option<String>) {
+        self.chip = chip;
+        self.selected = 0;
+    }
+
+    /// Move the highlight, wrapping around `count` visible rows.
+    pub fn move_next(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.selected = (self.selected + 1) % count;
+    }
+
+    /// Move the highlight up, wrapping around `count` visible rows.
+    pub fn move_prev(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.selected = self.selected.checked_sub(1).unwrap_or(count - 1);
+    }
+
+    /// Clamp a stale highlight after the match set shrank.
+    pub fn clamp_selection(&mut self, count: usize) {
+        if count == 0 {
+            self.selected = 0;
+        } else if self.selected >= count {
+            self.selected = count - 1;
+        }
+    }
+
+    /// Index of the highlighted row.
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+}
+
+/// Indices of `entries` visible for a query and chip filter.
+///
+/// Ranking is by [`rank`]. With an empty query the rows are a grouped browse
+/// view, so each section is kept together (in first-appearance order) while the
+/// order *within* a section is preserved. The returned indices always point at
+/// the original entries, so a choice maps straight back.
+pub fn visible_matches(query: &str, entries: &[PaletteEntry], chip: Option<&str>) -> Vec<usize> {
     let texts: Vec<String> = entries.iter().map(PaletteEntry::search_text).collect();
-    let matches = rank(&state.query, &texts);
-    if state.selected >= matches.len() {
-        state.selected = matches.len().saturating_sub(1);
+    let mut matches = rank(query, &texts);
+
+    if let Some(chip) = chip {
+        matches.retain(|&index| entries[index].tags.iter().any(|tag| tag == chip));
     }
 
-    let screen = ctx.viewport_rect();
-    let position = egui::pos2(
-        (screen.center().x - PALETTE_WIDTH / 2.0).max(screen.left() + 8.0),
-        screen.top() + 76.0,
-    );
-    let modal_id = egui::Id::new(("leetr-palette", id));
-
-    // Keyboard navigation is read before the widgets so a single key press
-    // cannot both move the cursor and activate a row.
-    let (moved_up, moved_down, activate) = ctx.input(|i| {
-        (
-            i.key_pressed(Key::ArrowUp) || (i.key_pressed(Key::Tab) && i.modifiers.shift),
-            i.key_pressed(Key::ArrowDown) || (i.key_pressed(Key::Tab) && !i.modifiers.shift),
-            i.key_pressed(Key::Enter),
-        )
-    });
-
-    if moved_up && !matches.is_empty() {
-        state.selected = state.selected.checked_sub(1).unwrap_or(matches.len() - 1);
-        state.scroll_to_selection = true;
-    }
-    if moved_down && !matches.is_empty() {
-        state.selected = (state.selected + 1) % matches.len();
-        state.scroll_to_selection = true;
-    }
-
-    // A rounded, shadowed card with a borderless search field and an
-    // accent-tinted selection reads as a modern launcher rather than a stock
-    // egui popup.
-    let popup_frame = egui::Frame::popup(ctx.global_style().as_ref())
-        .corner_radius(egui::CornerRadius::same(14))
-        .inner_margin(egui::Margin::ZERO)
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 12],
-            blur: 32,
-            spread: 0,
-            color: Color32::from_black_alpha(110),
-        });
-
-    let response = egui::Modal::new(modal_id)
-        .backdrop_color(Color32::from_black_alpha(150))
-        .frame(popup_frame)
-        .area(egui::Modal::default_area(modal_id).fixed_pos(position))
-        .show(ctx, |ui| {
-            let mut outcome = PaletteOutcome::default();
-            let mut empty_action_clicked = false;
-            ui.set_width(PALETTE_WIDTH);
-
-            let dark = ui.visuals().dark_mode;
-            let border = if dark {
-                Color32::from_rgb(0x2a, 0x2f, 0x37)
-            } else {
-                Color32::from_rgb(0xe6, 0xe8, 0xec)
-            };
-            let selection_fill = if dark {
-                Color32::from_rgb(0x2a, 0x35, 0x49)
-            } else {
-                Color32::from_rgb(0xe9, 0xef, 0xf9)
-            };
-            let hover_fill = if dark {
-                Color32::from_rgb(0x20, 0x25, 0x2c)
-            } else {
-                Color32::from_rgb(0xf2, 0xf4, 0xf7)
-            };
-
-            // -- search -------------------------------------------------
-            let search = egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(16, 14))
-                .show(ui, |ui| {
-                    let edit = ui.add(
-                        TextEdit::singleline(&mut state.query)
-                            .id(modal_id.with("query"))
-                            .hint_text(RichText::new(placeholder).size(15.0))
-                            .frame(egui::Frame::NONE)
-                            .font(egui::FontId::proportional(15.0))
-                            .desired_width(f32::INFINITY),
-                    );
-                    if std::mem::take(&mut state.grab_focus) {
-                        edit.request_focus();
-                    }
-                    if edit.changed() {
-                        state.selected = 0;
-                    }
-                });
-            ui.painter().hline(
-                search.response.rect.x_range(),
-                search.response.rect.bottom(),
-                egui::Stroke::new(1.0, border),
-            );
-
-            // -- results ------------------------------------------------
-            egui::ScrollArea::vertical()
-                .max_height(LIST_HEIGHT)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add_space(6.0);
-
-                    if matches.is_empty() {
-                        ui.add_space(12.0);
-                        ui.vertical_centered(|ui| match empty_action {
-                            Some(label) => {
-                                if ui
-                                    .add(egui::Button::new(label).corner_radius(8.0))
-                                    .clicked()
-                                {
-                                    empty_action_clicked = true;
-                                }
-                            }
-                            None => {
-                                ui.label(RichText::new("No matches").weak());
-                            }
-                        });
-                        ui.add_space(12.0);
-                        return;
-                    }
-
-                    for (row, &entry_index) in matches.iter().enumerate().take(MAX_ROWS) {
-                        let entry = &entries[entry_index];
-                        let is_selected = row == state.selected;
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), ROW_HEIGHT),
-                            egui::Sense::click(),
-                        );
-
-                        if ui.is_rect_visible(rect) {
-                            let pill = rect.shrink2(egui::vec2(6.0, 2.0));
-                            if is_selected {
-                                ui.painter().rect_filled(
-                                    pill,
-                                    egui::CornerRadius::same(8),
-                                    selection_fill,
-                                );
-                            } else if response.hovered() {
-                                ui.painter().rect_filled(
-                                    pill,
-                                    egui::CornerRadius::same(8),
-                                    hover_fill,
-                                );
-                            }
-
-                            let text_color = if is_selected {
-                                ui.visuals().strong_text_color()
-                            } else {
-                                ui.visuals().text_color()
-                            };
-                            let hint_color = ui.visuals().weak_text_color();
-                            let inner = rect.shrink2(egui::vec2(16.0, 0.0));
-
-                            let hint_font = egui::FontId::proportional(12.0);
-                            let hint_width = if entry.hint.is_empty() {
-                                0.0
-                            } else {
-                                ui.painter()
-                                    .layout_no_wrap(
-                                        entry.hint.clone(),
-                                        hint_font.clone(),
-                                        hint_color,
-                                    )
-                                    .size()
-                                    .x
-                                    + 16.0
-                            };
-
-                            // The entry's icon carries real information — for
-                            // Ctrl+P it is the solved / attempted / todo marker.
-                            // NOTE: this must stay. An earlier rewrite of this
-                            // row dropped it and silently removed those markers;
-                            // no test caught it because nothing asserted painted
-                            // output, only that rendering did not panic.
-                            let mut label_left = inner.left();
-                            if let Some(icon) = entry.icon.as_deref() {
-                                let galley = ui.painter().layout_no_wrap(
-                                    icon.to_owned(),
-                                    egui::FontId::monospace(14.0),
-                                    text_color,
-                                );
-                                let position = egui::pos2(
-                                    inner.left(),
-                                    inner.center().y - galley.size().y / 2.0,
-                                );
-                                label_left += galley.size().x + 8.0;
-                                ui.painter().galley(position, galley, text_color);
-                            }
-
-                            let label = ui.painter().layout(
-                                entry.label.clone(),
-                                egui::FontId::proportional(14.5),
-                                text_color,
-                                (inner.width() - hint_width - (label_left - inner.left()))
-                                    .max(40.0),
-                            );
-                            ui.painter().galley(
-                                egui::pos2(label_left, inner.center().y - label.size().y / 2.0),
-                                label,
-                                text_color,
-                            );
-
-                            if !entry.hint.is_empty() {
-                                ui.painter().text(
-                                    egui::pos2(inner.right(), inner.center().y),
-                                    egui::Align2::RIGHT_CENTER,
-                                    &entry.hint,
-                                    hint_font,
-                                    hint_color,
-                                );
-                            }
-                        }
-
-                        if is_selected && state.scroll_to_selection {
-                            response.scroll_to_me(Some(egui::Align::Center));
-                        }
-                        if response.clicked() {
-                            outcome.chosen = Some(entry_index);
-                        }
-                    }
-
-                    ui.add_space(6.0);
-                });
-
-            state.scroll_to_selection = false;
-
-            if activate {
-                if let Some(&entry_index) = matches.get(state.selected) {
-                    outcome.chosen = Some(entry_index);
+    if query.trim().is_empty() {
+        let mut order: Vec<&str> = Vec::new();
+        for entry in entries {
+            if let Some(section) = entry.section.as_deref() {
+                if !order.contains(&section) {
+                    order.push(section);
                 }
             }
-            if empty_action_clicked || (activate && matches.is_empty() && empty_action.is_some()) {
-                outcome.empty_action = true;
-            }
-
-            // -- footer ------------------------------------------------
-            let footer = egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(16, 10))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let hint = RichText::new("Up/Down navigate · Enter select · Esc close")
-                            .weak()
-                            .small();
-                        ui.label(hint);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{} of {}", matches.len(), entries.len()))
-                                    .weak()
-                                    .small(),
-                            );
-                        });
-                    });
-                });
-            ui.painter().hline(
-                footer.response.rect.x_range(),
-                footer.response.rect.top(),
-                egui::Stroke::new(1.0, border),
-            );
-
-            outcome
+        }
+        matches.sort_by_key(|&index| {
+            let section = entries[index].section.as_deref().unwrap_or("");
+            order
+                .iter()
+                .position(|s| *s == section)
+                .unwrap_or(usize::MAX)
         });
+    }
 
-    let should_close = response.should_close();
-    let mut outcome = response.inner;
-    if should_close {
-        outcome.closed = true;
-    }
-    if outcome.closed {
-        state.close();
-    }
-    outcome
+    matches
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glyphs;
 
     fn entry(label: &str, hint: &str) -> PaletteEntry {
         PaletteEntry::new(label).with_hint(hint)
@@ -589,6 +442,63 @@ mod tests {
         assert!(e.search_text().contains("Easy"));
     }
 
+    fn tagged(label: &str, section: &str, tags: &[&str]) -> PaletteEntry {
+        PaletteEntry::new(label)
+            .with_section(section)
+            .with_tags(tags.iter().map(|tag| (*tag).to_string()))
+    }
+
+    #[test]
+    fn an_empty_query_groups_rows_by_section() {
+        let entries = vec![
+            tagged("a", "Todo", &["todo"]),
+            tagged("b", "Solved", &["solved"]),
+            tagged("c", "Todo", &["todo"]),
+            tagged("d", "Solved", &["solved"]),
+        ];
+        // "Solved" first appears after "Todo", but within each section the
+        // original order is kept.
+        assert_eq!(visible_matches("", &entries, None), vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn a_chip_filter_narrows_by_tag() {
+        let entries = vec![
+            tagged("a", "Solved", &["easy", "solved"]),
+            tagged("b", "Todo", &["hard", "todo"]),
+            tagged("c", "Solved", &["hard", "solved"]),
+        ];
+        // Grouping still applies with a chip: "Solved" first appears before
+        // "Todo", so the hard rows come back as [c, b].
+        assert_eq!(visible_matches("", &entries, Some("hard")), vec![2, 1]);
+        assert_eq!(visible_matches("", &entries, Some("solved")), vec![0, 2]);
+        assert!(visible_matches("", &entries, Some("medium")).is_empty());
+    }
+
+    #[test]
+    fn a_query_and_a_chip_compose() {
+        let entries = vec![
+            tagged("Two Sum", "Solved", &["easy", "solved"]),
+            tagged("Two Sum II", "Solved", &["medium", "solved"]),
+            tagged("Median", "Todo", &["hard", "todo"]),
+        ];
+        // "two" ranks both Two Sum rows; the chip then keeps only the easy one.
+        let matched = visible_matches("two", &entries, Some("easy"));
+        assert_eq!(matched, vec![0]);
+    }
+
+    #[test]
+    fn a_query_does_not_group_rows() {
+        // With a query the list is a ranked flat view, not a grouped one:
+        // "a" matches every row and they come back in score order.
+        let entries = vec![
+            tagged("alpha", "Todo", &[]),
+            tagged("beta", "Solved", &[]),
+            tagged("gamma", "Todo", &[]),
+        ];
+        assert_eq!(visible_matches("a", &entries, None), vec![0, 1, 2]);
+    }
+
     #[test]
     fn palette_state_opens_clean_and_closes_clean() {
         let mut state = PaletteState::default();
@@ -598,105 +508,37 @@ mod tests {
         assert!(state.is_open());
         assert_eq!(state.query(), "");
         assert_eq!(state.selected, 0);
+        assert_eq!(state.active_chip(), None);
 
         state.query = "abc".into();
         state.selected = 5;
+        state.chip = Some("easy".into());
         state.close();
         assert!(!state.is_open());
         assert_eq!(state.query(), "");
         assert_eq!(state.selected, 0);
+        assert_eq!(state.active_chip(), None);
         assert!(!state.grab_focus);
     }
 
     #[test]
-    fn palette_renders_without_panicking() {
-        let entries = vec![
-            entry("Toggle theme", "Dark → Light").with_icon(glyphs::MOON),
-            entry("Refresh problems", ""),
-        ];
-        let ctx = egui::Context::default();
+    fn navigation_wraps_around_the_visible_rows() {
         let mut state = PaletteState::default();
         state.open();
-
-        for query in ["", "theme", "zzzz"] {
-            state.open();
-            state.query = query.to_string();
-            let mut output = ctx.run_ui(Default::default(), |_ui| {
-                let outcome = show(&ctx, &mut state, "test", "Search…", &entries, None);
-                assert!(outcome.chosen.is_none(), "nothing should be chosen");
-            });
-            output.textures_delta.clear();
-        }
-    }
-
-    fn key_event(key: Key) -> egui::RawInput {
-        egui::RawInput {
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn enter_selects_the_top_match() {
-        let entries = vec![
-            entry("Toggle theme", "switch to Light mode"),
-            entry("Quit Leetr", ""),
-        ];
-        let ctx = egui::Context::default();
-        let mut state = PaletteState::default();
-        state.open();
-        state.query = "theme".into();
-
-        let mut chosen = None;
-        let mut output = ctx.run_ui(key_event(Key::Enter), |_ui| {
-            chosen = show(&ctx, &mut state, "t", "…", &entries, None).chosen;
-        });
-        output.textures_delta.clear();
-
-        assert_eq!(chosen, Some(0), "Enter must activate the highlighted row");
-    }
-
-    #[test]
-    fn arrow_keys_move_the_selection() {
-        let entries = vec![entry("alpha", ""), entry("beta", ""), entry("gamma", "")];
-        let ctx = egui::Context::default();
-        let mut state = PaletteState::default();
-        state.open();
-
-        let mut output = ctx.run_ui(key_event(Key::ArrowDown), |_ui| {
-            show(&ctx, &mut state, "t", "…", &entries, None);
-        });
-        output.textures_delta.clear();
-        assert_eq!(state.selected, 1);
-
-        let mut output = ctx.run_ui(key_event(Key::ArrowUp), |_ui| {
-            show(&ctx, &mut state, "t", "…", &entries, None);
-        });
-        output.textures_delta.clear();
-        assert_eq!(state.selected, 0);
-    }
-
-    #[test]
-    fn closing_clears_the_state() {
-        let entries = vec![entry("Quit", "")];
-        let ctx = egui::Context::default();
-        let mut state = PaletteState::default();
-        state.open();
-
-        let mut output = ctx.run_ui(Default::default(), |_ui| {
-            let mut outcome = show(&ctx, &mut state, "test", "Search…", &entries, None);
-            outcome.closed = true;
-            if outcome.closed {
-                state.close();
-            }
-        });
-        output.textures_delta.clear();
-        assert!(!state.is_open());
+        state.move_next(3);
+        assert_eq!(state.selected(), 1);
+        state.move_next(3);
+        state.move_next(3);
+        assert_eq!(state.selected(), 0);
+        state.move_prev(3);
+        assert_eq!(state.selected(), 2);
+        state.set_query("two".into());
+        assert_eq!(state.query(), "two");
+        assert_eq!(state.selected(), 0);
+        state.set_chip(Some("easy".into()));
+        assert_eq!(state.active_chip(), Some("easy"));
+        state.clamp_selection(1);
+        state.move_next(0);
+        state.move_prev(0);
     }
 }

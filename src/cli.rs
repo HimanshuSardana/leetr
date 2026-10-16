@@ -20,11 +20,12 @@ pub enum Command {
     Init,
     NvimPlugin,
     InstallNvimPlugin,
+    InstallDesktopEntry,
 }
 
 impl Command {
     /// Every command, in the order `--help` lists them.
-    pub const ALL: [Command; 7] = [
+    pub const ALL: [Command; 8] = [
         Command::List,
         Command::Show,
         Command::Languages,
@@ -32,6 +33,7 @@ impl Command {
         Command::Init,
         Command::NvimPlugin,
         Command::InstallNvimPlugin,
+        Command::InstallDesktopEntry,
     ];
 
     /// The word the user types.
@@ -44,6 +46,7 @@ impl Command {
             Self::Init => "init",
             Self::NvimPlugin => "nvim-plugin",
             Self::InstallNvimPlugin => "install-nvim-plugin",
+            Self::InstallDesktopEntry => "install-desktop-entry",
         }
     }
 
@@ -57,6 +60,7 @@ impl Command {
             Self::Init => "init",
             Self::NvimPlugin => "nvim-plugin",
             Self::InstallNvimPlugin => "install-nvim-plugin",
+            Self::InstallDesktopEntry => "install-desktop-entry",
         }
     }
 
@@ -69,6 +73,7 @@ impl Command {
             Self::Init => "Write default config + credentials files",
             Self::NvimPlugin => "Print where the nvim plugin is installed",
             Self::InstallNvimPlugin => "Install the nvim plugin into your nvim config",
+            Self::InstallDesktopEntry => "Install the app-launcher entry + icon",
         }
     }
 
@@ -147,7 +152,7 @@ pub const GLOBAL_FLAGS: &[Flag] = &[
     },
 ];
 
-const PREAMBLE: &str = "leetr — a lightweight egui LeetCode client";
+const PREAMBLE: &str = "leetr — a lightweight GPUI LeetCode client";
 const FILES: &str = "\
 FILES:
     config       ~/.config/leetr/config.toml
@@ -262,10 +267,11 @@ mod tests {
                 | Command::Whoami
                 | Command::Init
                 | Command::NvimPlugin
-                | Command::InstallNvimPlugin => {}
+                | Command::InstallNvimPlugin
+                | Command::InstallDesktopEntry => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 7);
+        assert_eq!(Command::ALL.len(), 8);
     }
 
     #[test]

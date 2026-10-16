@@ -33,6 +33,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig-dev \
+            libfreetype-dev \
             libxkbcommon-dev \
             libxcb-render0-dev \
             libxcb-shape0-dev \

@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use leetr::app;
 use leetr::cli::{self, Command};
 use leetr::config::{self, Credentials};
+use leetr::desktop;
 use leetr::leetcode::client::ProblemQuery;
 use leetr::leetcode::{html, LeetCodeClient};
 use leetr::model::{ProblemStatus, QuestionDetail};
@@ -47,6 +48,7 @@ fn run(command: Command, args: &[String]) -> Result<()> {
             println!("the plugin is embedded in this binary; install it with `leetr install-nvim-plugin`");
         }
         Command::InstallNvimPlugin => cmd_install_nvim_plugin()?,
+        Command::InstallDesktopEntry => cmd_install_desktop_entry()?,
         Command::List => cmd_list(&client()?, args)?,
         Command::Show => cmd_show(&client()?, args)?,
         Command::Languages => cmd_languages(&client()?)?,
@@ -61,6 +63,23 @@ fn client() -> Result<LeetCodeClient> {
 }
 
 /// Copy the embedded plugin into the user's nvim config.
+/// Install the XDG desktop entry + icon so Leetr shows up in app launchers.
+fn cmd_install_desktop_entry() -> Result<()> {
+    let desktop = desktop::default_desktop_path()
+        .ok_or_else(|| anyhow::anyhow!("could not locate your data directory"))?;
+    let icon = desktop::default_icon_path()
+        .ok_or_else(|| anyhow::anyhow!("could not locate your data directory"))?;
+
+    match desktop::install(&desktop, &icon) {
+        Ok(outcome) if outcome.desktop_written || outcome.icon_written => {
+            println!("installed {}", desktop.display());
+        }
+        Ok(_) => println!("already up to date: {}", desktop.display()),
+        Err(err) => bail!("{err}"),
+    }
+    Ok(())
+}
+
 fn cmd_install_nvim_plugin() -> Result<()> {
     let dest = nvim::default_plugin_path()
         .ok_or_else(|| anyhow::anyhow!("could not locate your config directory"))?;
