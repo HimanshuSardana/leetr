@@ -1148,6 +1148,21 @@ impl LeetrView {
     }
 
     /// One confirmed command-palette row.
+    /// Search LeetCode for whatever is typed in the problem palette.
+    ///
+    /// The same thing the palette's fallback row does, reachable without
+    /// hunting for that row — and the row only exists when the local list came
+    /// up empty, so a query that matched something locally had no way to reach
+    /// the server at all.
+    fn search_typed_query(&mut self, cx: &mut App) {
+        let query = self.problems_cmd.read(cx).query(cx).to_string();
+        if query.trim().is_empty() {
+            return;
+        }
+        self.close_palette();
+        self.search_problems(query);
+    }
+
     fn confirm_palette(
         &mut self,
         kind: PaletteKind,
@@ -2455,10 +2470,22 @@ fn bind_global_actions(cx: &mut App, view: &Entity<LeetrView>) {
     listener::<Quit>(cx, view, |_, cx| cx.quit());
     listener::<OpenInNvim>(cx, view, |this, _| this.open_in_nvim());
     listener::<RunTests>(cx, view, |this, _| this.start_judge(false));
-    listener::<SubmitSolution>(cx, view, |this, _| this.start_judge(true));
+    // Ctrl+Enter means "go": submit the solution normally, but run the typed
+    // query against LeetCode while the problem palette is open. One handler
+    // rather than two bindings for the same keystroke, which would be
+    // ambiguous.
+    listener::<SubmitSolution>(cx, view, |this, cx| {
+        if this.open_palette == Some(PaletteKind::Problems) {
+            this.search_typed_query(cx);
+        } else {
+            this.start_judge(true);
+        }
+    });
     listener::<ToggleSidebar>(cx, view, |this, _| {
         this.sidebar_collapsed = !this.sidebar_collapsed;
     });
+    listener::<ShowStatementTab>(cx, view, |this, _| this.tab = Tab::Statement);
+    listener::<ShowCodeTab>(cx, view, |this, _| this.tab = Tab::Code);
 }
 
 /// Start the GPUI application.
