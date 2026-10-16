@@ -51,11 +51,6 @@ pub fn is_emphasis(span: &Span) -> bool {
     )
 }
 
-/// Human-readable header line, e.g. `"1. Two Sum"`.
-pub fn title_line(detail: &QuestionDetail) -> String {
-    format!("{}. {}", detail.frontend_id, detail.title)
-}
-
 /// Placeholder shown when no problem is selected.
 pub fn empty_message(loading: bool) -> &'static str {
     if loading {
@@ -147,6 +142,6 @@ mod tests {
         assert!(missing_body_message(&detail).contains("premium"));
         detail.paid_only = false;
         assert!(!missing_body_message(&detail).is_empty());
-        assert_eq!(title_line(&detail), "1. Two Sum");
+        assert_eq!(detail.title, "Two Sum");
     }
 }

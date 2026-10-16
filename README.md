@@ -116,7 +116,8 @@ leetr whoami    # verifies the session and reports how many problems you've solv
 | `Ctrl+O` | Open the current solution in nvim |
 | `Ctrl+'` | Run the sample tests |
 | `Ctrl+Enter` | Submit the solution (respects the [safety rail](#safety-rail)) |
-| `Ctrl+B` | Collapse the sidebar to an icon rail |
+| `Ctrl+B` | Collapse the sidebar |
+| `Alt+1` / `Alt+2` | Switch to the statement / code pane |
 
 While a palette is open it takes the keyboard instead:
 

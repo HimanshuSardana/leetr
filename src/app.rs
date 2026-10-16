@@ -16,12 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::base::Selectable;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
-use gpui_kit::component::sidebar::{
-    Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenuItem, SidebarToggleButton,
-};
+use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon};
 // The complete Lucide catalog ships with the assets crate; the component's own
 // `IconName` is only the small legacy subset.
@@ -29,7 +28,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tab::{Tab as KitTab, TabBar};
 use gpui_kit::component::theme::Theme as KitTheme;
-use gpui_kit::component::IndexPath;
+use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::Focusable;
 use gpui_kit::{
@@ -1425,68 +1424,18 @@ impl LeetrView {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let matching = self.list_state.matching(&self.problems);
         let shown = matching.len().min(self.row_cap);
-        let badge = self.auth_badge();
-        let (session_text, session_color) = session_line(&badge);
-        let theme_label = self.config.theme.label().to_string();
-        let theme_icon = self.config.theme.icon().to_string();
         let view = cx.entity();
 
-        // ---- header: brand, session, quick actions, search ----
-        let toggle_view = view.clone();
+        // ---- header: just the filter field ----
+        //
+        // The brand, the session line, the theme button and the quick-actions
+        // button used to live here. The sidebar is a list now: identity and
+        // theme are in the status bar and the command palette.
         let header = div()
             .flex()
             .flex_col()
             .w_full()
             .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_lg().font_weight(FontWeight::BOLD).child("leetr"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1()
-                            .child(
-                                SidebarToggleButton::new()
-                                    .collapsed(self.sidebar_collapsed)
-                                    .accessibility_label("Toggle sidebar")
-                                    .on_click(move |_, window, cx| {
-                                        toggle_view.update(cx, |this, _| {
-                                            this.sidebar_collapsed = !this.sidebar_collapsed;
-                                        });
-                                        window.refresh();
-                                    }),
-                            )
-                            .child(
-                                Button::new("theme-toggle")
-                                    .label(format!("{theme_icon} {theme_label}"))
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.toggle_theme(cx);
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(match session_color {
-                        Some(hex) => rgb(hex),
-                        None => rgb(MUTED_DARK),
-                    })
-                    .child(session_text),
-            )
-            .child(
-                Button::new("quick-actions")
-                    .label("Quick actions  ⌘K")
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.open_actions_palette(window, cx);
-                    })),
-            )
             .child(Input::new(&self.search_input).id("problem-search"));
 
         // ---- "Filter" group: status, level, premium ----
@@ -1613,20 +1562,14 @@ impl LeetrView {
             let slug = problem.slug.clone();
             let active = self.selected.as_deref() == Some(slug.as_str());
             let label = format!("{}. {}", problem.id, problem.title);
-            let diff_label = problem.difficulty.label().to_string();
-            let diff_hex = theme::difficulty_hex(problem.difficulty);
             let icon = Self::status_icon(problem.status, problem.difficulty);
             let item_view = view.clone();
+            // The dot's colour already says easy/medium/hard, so the row
+            // carries no difficulty text.
             problem_items.push(
                 SidebarMenuItem::new(label)
                     .icon(icon)
                     .active(active)
-                    .suffix(move |_, _| {
-                        div()
-                            .text_xs()
-                            .text_color(rgb(diff_hex))
-                            .child(diff_label.clone())
-                    })
                     .on_click(move |_, window, cx| {
                         let slug = slug.clone();
                         item_view.update(cx, |this, _| this.open_problem(slug));
@@ -1780,11 +1723,39 @@ impl LeetrView {
                 .into_any_element();
         };
 
-        // The underline variant: children inherit it from the bar, and the
-        // active pane is marked by the sliding underline rather than a filled
-        // pill, which keeps the statement/code switch visually quiet.
+        // The collapse control is the tab bar's prefix rather than a sibling, so
+        // it sits inside the bar's background and stays reachable with the
+        // sidebar hidden. It is a plain button rather than
+        // `SidebarToggleButton` so its surface can be set explicitly: in dark
+        // mode it reads as a black tile against the bar.
+        let toggle_view = cx.entity();
+        let toggle_icon = if self.sidebar_collapsed {
+            IconName::PanelLeftOpen
+        } else {
+            IconName::PanelLeftClose
+        };
+        let toggle_surface = if cx.theme().is_dark() {
+            rgb(0x000000).into()
+        } else {
+            gpui_kit::transparent_black()
+        };
+        let sidebar_toggle = Button::new("sidebar-toggle")
+            .ghost()
+            .small()
+            .bg(toggle_surface)
+            .icon(Icon::new(toggle_icon).size_4())
+            .accessibility_label("Toggle sidebar")
+            .on_click(move |_, window, cx| {
+                toggle_view.update(cx, |this, _| {
+                    this.sidebar_collapsed = !this.sidebar_collapsed;
+                });
+                window.refresh();
+            });
+
         let tabs = TabBar::new("leetr-tabs")
-            .underline()
+            .w_full()
+            .py_1()
+            .prefix(sidebar_toggle)
             .selected_index(match self.tab {
                 Tab::Statement => 0,
                 Tab::Code => 1,
@@ -1814,15 +1785,16 @@ impl LeetrView {
             Tab::Code => self.render_code(cx),
         };
 
+        // The tab bar is flush with the pane's edges — no outer padding or
+        // gap — so its background spans the full width. The padding belongs to
+        // the content underneath it.
         div()
             .flex()
             .flex_col()
             .flex_1()
             .h_full()
-            .p_3()
-            .gap_2()
             .child(tabs)
-            .child(pane)
+            .child(div().flex().flex_col().flex_1().p_3().gap_2().child(pane))
             .into_any_element()
     }
 
@@ -1833,22 +1805,9 @@ impl LeetrView {
             .gap_1()
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_baseline()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED_DARK))
-                            .child(detail.frontend_id.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .child(detail.title.clone()),
-                    ),
+                    .text_lg()
+                    .font_weight(FontWeight::BOLD)
+                    .child(detail.title.clone()),
             )
             .child(
                 div()
@@ -1972,57 +1931,14 @@ impl LeetrView {
                     .overflow_hidden()
                     .child(Editor::new(&self.code_input).size_full()),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(
-                        Button::new("run-tests")
-                            .label("Run tests")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.start_judge(false);
-                                cx.notify();
-                            })),
-                    )
-                    .child(Button::new("submit").label("Submit").on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            this.start_judge(true);
-                            cx.notify();
-                        },
-                    )))
-                    .child(
-                        Button::new("open-nvim")
-                            .label("Open in nvim")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.open_in_nvim();
-                                cx.notify();
-                            })),
-                    ),
-            )
             .child(judge)
             .into_any_element()
     }
 
     fn render_status_bar(&self) -> AnyElement {
-        let badge = self.auth_badge();
-        let badge_text = match &badge {
-            AuthBadge::SignedIn { username, solved } if username.is_empty() => {
-                format!("{} signed in · {solved} solved", crate::glyphs::DOT)
-            }
-            AuthBadge::SignedIn { username, solved } => {
-                format!("{} {username} · {solved} solved", crate::glyphs::DOT)
-            }
-            AuthBadge::Rejected => format!("{} session rejected", crate::glyphs::DOT),
-            AuthBadge::Checking => "checking session…".to_string(),
-            AuthBadge::BrowseOnly => format!("{} browse-only", crate::glyphs::DOT),
-        };
-        let badge_color = match &badge {
-            AuthBadge::SignedIn { .. } => theme::SUCCESS_HEX,
-            AuthBadge::Rejected => theme::DANGER_HEX,
-            AuthBadge::Checking => MUTED_DARK,
-            AuthBadge::BrowseOnly => theme::WARNING_HEX,
-        };
+        let (session_text, session_color) = session_line(&self.auth_badge());
+        let badge_text = format!("{} {session_text}", crate::glyphs::DOT);
+        let badge_color = session_color.unwrap_or(MUTED_DARK);
         let message = match self.error.as_deref() {
             Some(err) => err.to_string(),
             None => self.status.clone(),
