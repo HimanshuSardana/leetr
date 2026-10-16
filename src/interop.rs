@@ -45,8 +45,11 @@ pub struct Snapshot {
     pub solved: bool,
     /// Whether a statement is loaded and ready to edit.
     pub ready: bool,
-    /// Free-form status line, mirrored from the app.
+    /// Free-form status line, mirrored from the app. Transient by nature.
     pub status: String,
+    /// Durable authentication state.
+    #[serde(default)]
+    pub auth: AuthState,
     /// Latest judge result, if any.
     #[serde(default)]
     pub judge: Option<JudgeSummary>,
@@ -68,6 +71,25 @@ pub enum Command {
     Run,
     /// Submit the current buffer.
     Submit,
+}
+
+/// Authentication state, mirrored for tooling.
+///
+/// Structured rather than left to the free-text `status` field, which is a
+/// transient slot that routine messages legitimately overwrite — and which was
+/// therefore an unreliable place to report a standing condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthState {
+    /// The session check has not finished yet.
+    Checking,
+    /// LeetCode accepted the session.
+    SignedIn,
+    /// Credentials are present but LeetCode refused them (expired cookie).
+    Rejected,
+    /// No credentials configured.
+    #[default]
+    BrowseOnly,
 }
 
 /// The latest judge result, mirrored for the plugin.
@@ -101,7 +123,7 @@ pub struct OpenRequest {
 
 /// Called when a command is queued, so the UI can wake up and apply it.
 ///
-/// egui only runs a frame when something asks it to, so without this a queued
+/// the UI polls on a timer, but without this a queued
 /// command would sit unapplied until the user happened to interact.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
@@ -653,6 +675,38 @@ mod tests {
         assert_eq!(status, 200, "a stalled client blocked the server: {body}");
 
         drop(stalled);
+    }
+
+    /// Auth must survive as structured data, because the free-text `status`
+    /// field is transient and a routine message can legitimately overwrite it.
+    #[test]
+    fn auth_state_is_reported_structurally() {
+        let (server, shared) = server();
+
+        shared.publish(Snapshot {
+            auth: AuthState::Rejected,
+            status: "50 problems loaded".into(),
+            ..Snapshot::default()
+        });
+
+        let (status, body) = request(server.port(), "GET", "/state", None);
+        assert_eq!(status, 200);
+        let parsed: Snapshot = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.auth, AuthState::Rejected);
+        // The point: the standing condition is readable even though the
+        // transient status says something unrelated.
+        assert_eq!(parsed.status, "50 problems loaded");
+    }
+
+    #[test]
+    fn a_snapshot_without_auth_defaults_to_browse_only() {
+        // A complete payload that predates the `auth` field must still parse,
+        // defaulting to BrowseOnly.
+        let parsed: Snapshot = serde_json::from_str(
+            r#"{"code":"","solved":false,"ready":false,"status":"","version":"0.1.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.auth, AuthState::BrowseOnly);
     }
 
     #[test]
