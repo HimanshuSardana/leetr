@@ -1939,25 +1939,27 @@ impl LeetrView {
 
         // The problem's snippet list can run to a dozen languages, which as a
         // row of buttons wrapped onto extra lines. It is a dropdown now.
+        // The trigger's own caret is supplied by `DropdownButton`; asking the
+        // inner `Button` for one as well drew two.
+        let current_slug = buffer.lang_slug.clone();
         let current = self
             .languages
             .iter()
-            .find(|choice| choice.slug == buffer.lang_slug)
+            .find(|choice| choice.slug == current_slug)
             .map(|choice| choice.label.clone())
-            .unwrap_or_else(|| buffer.lang_slug.clone());
+            .unwrap_or_else(|| current_slug.clone());
         let choices = self.languages.clone();
         let menu_view = cx.entity();
         let language_picker = DropdownButton::new("language-picker")
-            .button(
-                Button::new("language-picker-button")
-                    .label(current)
-                    .dropdown_caret(true),
-            )
+            .button(Button::new("language-picker-button").label(current))
             .dropdown_menu(move |menu, _window, _cx| {
                 let mut menu = menu;
                 for choice in &choices {
+                    // Ticks the language the editor is actually using — the
+                    // first version compared a value with itself and so ticked
+                    // every row.
+                    let selected = choice.slug == current_slug;
                     let slug = choice.slug.clone();
-                    let selected = slug == choice.slug;
                     let view = menu_view.clone();
                     menu = menu.item(
                         PopupMenuItem::new(choice.label.clone())
