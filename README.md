@@ -83,8 +83,8 @@ cd leetr
 cargo install --path .          # or: cargo build --release
 ```
 
-Requirements: Rust 1.92+ (the `gpui-kit` 0.7 stack and its `oo7` secret-service
-dependency need it), and on Linux the usual windowing headers
+Requirements: Rust 1.93+ (the `gpui-kit` 0.7 stack; see `rust-version` in
+`Cargo.toml` for which dependency sets each floor), and on Linux the usual windowing headers
 (`libxkbcommon`, `libxcb`, `libx11`, `libwayland`, `libgl`). Optional: `nvim`, `tmux`.
 
 The first run writes default config to `~/.config/leetr/`.

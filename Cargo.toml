@@ -2,11 +2,15 @@
 name = "leetr"
 version = "0.1.0"
 edition = "2021"
-# The MSRV is what the dependency graph demands, not a preference: the
-# gpui-pre stack needs edition 2024 (1.85), tree-sitter-language asks for 1.90,
-# and gpui-pre-linux pulls oo7 (secret-service), which asks for 1.92. CI builds
-# with exactly this toolchain, so a stale value fails there rather than here.
-rust-version = "1.92"
+# The MSRV is what the dependency graph actually demands, not a preference, and
+# CI builds with exactly this toolchain:
+#   * edition 2024 needs 1.85 (the gpui-pre crates use it),
+#   * `tree-sitter-language` declares 1.90,
+#   * `oo7` (secret-service, via gpui-pre-linux) declares 1.92, and
+#   * `gpui-pre-util` calls `<[T]>::as_array`, stabilized in 1.93.0.
+# So 1.92 is not enough despite being the highest *declared* floor, and GPUI
+# Kit's own installation guide ("Rust 1.92 or later") is optimistic.
+rust-version = "1.93"
 description = "A lightweight GPUI LeetCode client with first-class nvim interoperability"
 license = "MIT"
 repository = "https://github.com/HimanshuSardana/leetr"
