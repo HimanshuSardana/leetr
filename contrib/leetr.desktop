@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Leetr
+GenericName=LeetCode client
+Comment=A lightweight GPUI LeetCode client with first-class nvim integration
+Exec=__EXEC__
+Icon=__ICON__
+Terminal=false
+Categories=Development;IDE;Education;
+Keywords=leetcode;leetr;code;problems;judge;algorithms;dsa;programming;interview;
+StartupNotify=false
