@@ -110,6 +110,22 @@ local function current_payload(include_code)
   return payload, name
 end
 
+--- Render a judge verdict from the app's state, if there is one.
+local function verdict_text(state)
+  local judge = state and state.judge
+  if not judge then
+    return nil
+  end
+  if judge.error then
+    return judge.error
+  end
+  local text = judge.verdict or "?"
+  if judge.summary and judge.summary ~= "" and judge.summary ~= judge.verdict then
+    text = text .. " — " .. judge.summary
+  end
+  return text
+end
+
 function M.status()
   request("GET", "/state", nil, function(ok, body)
     if not ok then
@@ -127,6 +143,16 @@ function M.status()
       state.language or "?",
       state.solved and "solved" or "unsolved"
     )
+
+    -- Structured, so an expired cookie is distinguishable from never having
+    -- configured credentials: they need different fixes.
+    if state.auth == "rejected" then
+      message = message .. "\nsession rejected — the cookies have probably expired"
+    elseif state.auth == "browse_only" then
+      message = message .. "\nbrowse-only — no credentials configured"
+    elseif state.auth == "checking" then
+      message = message .. "\nchecking session…"
+    end
     local verdict = verdict_text(state)
     if verdict then
       message = message .. "\n" .. verdict
@@ -170,22 +196,6 @@ function M.pull()
       notify("opened " .. state.file)
     end
   end)
-end
-
---- Render a judge verdict from the app's state, if there is one.
-local function verdict_text(state)
-  local judge = state and state.judge
-  if not judge then
-    return nil
-  end
-  if judge.error then
-    return judge.error
-  end
-  local text = judge.verdict or "?"
-  if judge.summary and judge.summary ~= "" and judge.summary ~= judge.verdict then
-    text = text .. " — " .. judge.summary
-  end
-  return text
 end
 
 function M.run()
