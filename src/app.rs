@@ -1890,27 +1890,52 @@ impl LeetrView {
                 .into_any_element();
         };
 
+        // The problem's snippet list can run to a dozen languages, which as a
+        // row of buttons wrapped onto extra lines. It is a dropdown now.
+        let current = self
+            .languages
+            .iter()
+            .find(|choice| choice.slug == buffer.lang_slug)
+            .map(|choice| choice.label.clone())
+            .unwrap_or_else(|| buffer.lang_slug.clone());
+        let choices = self.languages.clone();
+        let menu_view = cx.entity();
+        let language_picker = DropdownButton::new("language-picker")
+            .button(
+                Button::new("language-picker-button")
+                    .label(current)
+                    .dropdown_caret(true),
+            )
+            .dropdown_menu(move |menu, _window, _cx| {
+                let mut menu = menu;
+                for choice in &choices {
+                    let slug = choice.slug.clone();
+                    let selected = slug == choice.slug;
+                    let view = menu_view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label.clone())
+                            .checked(selected)
+                            .on_click(move |_, _window, cx| {
+                                let slug = slug.clone();
+                                view.update(cx, |this, _| this.switch_language(slug));
+                            }),
+                    );
+                }
+                menu
+            });
+
         let lang_row = div()
             .flex()
             .flex_row()
-            .gap_1()
-            .children(self.languages.iter().map(|choice| {
-                let slug = choice.slug.clone();
-                let active = buffer.lang_slug == slug;
-                Button::new(SharedString::from(format!("lang-{slug}")))
-                    .label(choice.label.clone())
-                    .toggled(active)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.switch_language(slug.clone());
-                        cx.notify();
-                    }))
-            }));
+            .items_center()
+            .gap_2()
+            .child(language_picker);
 
         let judge = match self.judge.clone() {
             None => div()
                 .text_xs()
                 .text_color(rgb(MUTED_DARK))
-                .child("Run the sample tests, or submit when you are confident.")
+                .child("Ctrl+' runs the sample tests · Ctrl+Enter submits · Ctrl+O opens nvim")
                 .into_any_element(),
             Some(view) => render_judge(&view),
         };
