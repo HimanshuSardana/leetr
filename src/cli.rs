@@ -152,7 +152,7 @@ pub const GLOBAL_FLAGS: &[Flag] = &[
     },
 ];
 
-const PREAMBLE: &str = "leetr — a lightweight egui LeetCode client";
+const PREAMBLE: &str = "leetr — a lightweight GPUI LeetCode client";
 const FILES: &str = "\
 FILES:
     config       ~/.config/leetr/config.toml
