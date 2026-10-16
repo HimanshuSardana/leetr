@@ -9,23 +9,12 @@
 //! headers, and rows whose trailing edge carries either a shortcut key cap or a
 //! muted hint.
 
-use egui::{
-    Align2, Color32, CornerRadius, FontId, Key, Margin, RichText, Sense, Stroke, StrokeKind,
-    TextEdit,
-};
+//!
+//! Rendering lives in the GPUI views (`crate::app`): this module keeps the
+//! matching, ranking and open/close state so it stays unit-testable.
 
-use crate::glyphs;
-
-/// Width of the palette popup.
-const PALETTE_WIDTH: f32 = 660.0;
-/// Height of the scrollable result list.
-const LIST_HEIGHT: f32 = 380.0;
 /// Upper bound on rendered rows, so a 4000-entry list stays instant.
-const MAX_ROWS: usize = 200;
-/// Height of one result row.
-const ROW_HEIGHT: f32 = 40.0;
-/// Height of a key cap / shortcut badge.
-const CAP_HEIGHT: f32 = 20.0;
+pub const MAX_ROWS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Fuzzy matching
@@ -275,71 +264,48 @@ pub struct PaletteOutcome {
     pub empty_action: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
+impl PaletteState {
+    /// Replace the query (GPUI input drives this) and reset the cursor.
+    pub fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.selected = 0;
+    }
 
-/// Colours that differ between the two themes.
-struct Colors {
-    border: Color32,
-    selection_fill: Color32,
-    hover_fill: Color32,
-    chip_fill: Color32,
-    chip_border: Color32,
-    chip_active_fill: Color32,
-    cap_fill: Color32,
-    cap_border: Color32,
-}
+    /// Activate a filter chip; `None` means "All".
+    pub fn set_chip(&mut self, chip: Option<String>) {
+        self.chip = chip;
+        self.selected = 0;
+    }
 
-fn colors(dark: bool) -> Colors {
-    if dark {
-        Colors {
-            border: Color32::from_rgb(0x2a, 0x2f, 0x37),
-            selection_fill: Color32::from_rgb(0x2a, 0x35, 0x49),
-            hover_fill: Color32::from_rgb(0x20, 0x25, 0x2c),
-            chip_fill: Color32::from_rgb(0x22, 0x26, 0x2c),
-            chip_border: Color32::from_rgb(0x33, 0x39, 0x42),
-            chip_active_fill: Color32::from_rgb(0x2a, 0x35, 0x49),
-            cap_fill: Color32::from_rgb(0x1c, 0x20, 0x26),
-            cap_border: Color32::from_rgb(0x39, 0x3f, 0x49),
+    /// Move the highlight, wrapping around `count` visible rows.
+    pub fn move_next(&mut self, count: usize) {
+        if count == 0 {
+            return;
         }
-    } else {
-        Colors {
-            border: Color32::from_rgb(0xe6, 0xe8, 0xec),
-            selection_fill: Color32::from_rgb(0xe9, 0xef, 0xf9),
-            hover_fill: Color32::from_rgb(0xf2, 0xf4, 0xf7),
-            chip_fill: Color32::from_rgb(0xf3, 0xf4, 0xf7),
-            chip_border: Color32::from_rgb(0xdc, 0xdf, 0xe4),
-            chip_active_fill: Color32::from_rgb(0xe4, 0xec, 0xfa),
-            cap_fill: Color32::from_rgb(0xf1, 0xf2, 0xf5),
-            cap_border: Color32::from_rgb(0xd5, 0xd9, 0xdf),
+        self.selected = (self.selected + 1) % count;
+    }
+
+    /// Move the highlight up, wrapping around `count` visible rows.
+    pub fn move_prev(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.selected = self.selected.checked_sub(1).unwrap_or(count - 1);
+    }
+
+    /// Clamp a stale highlight after the match set shrank.
+    pub fn clamp_selection(&mut self, count: usize) {
+        if count == 0 {
+            self.selected = 0;
+        } else if self.selected >= count {
+            self.selected = count - 1;
         }
     }
-}
 
-/// Size a key cap needs to fit `text`.
-fn key_cap_size(ui: &egui::Ui, text: &str) -> egui::Vec2 {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        FontId::monospace(11.0),
-        Color32::PLACEHOLDER,
-    );
-    egui::vec2(galley.size().x + 16.0, CAP_HEIGHT)
-}
-
-/// Paint a bordered key cap.
-fn paint_key_cap(ui: &egui::Ui, rect: egui::Rect, text: &str, border: Color32, fill: Color32) {
-    let radius = CornerRadius::same(5);
-    ui.painter().rect_filled(rect, radius, fill);
-    ui.painter()
-        .rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        text,
-        FontId::monospace(11.0),
-        ui.visuals().weak_text_color(),
-    );
+    /// Index of the highlighted row.
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
 }
 
 /// Indices of `entries` visible for a query and chip filter.
@@ -348,7 +314,7 @@ fn paint_key_cap(ui: &egui::Ui, rect: egui::Rect, text: &str, border: Color32, f
 /// view, so each section is kept together (in first-appearance order) while the
 /// order *within* a section is preserved. The returned indices always point at
 /// the original entries, so a choice maps straight back.
-fn visible_matches(query: &str, entries: &[PaletteEntry], chip: Option<&str>) -> Vec<usize> {
+pub fn visible_matches(query: &str, entries: &[PaletteEntry], chip: Option<&str>) -> Vec<usize> {
     let texts: Vec<String> = entries.iter().map(PaletteEntry::search_text).collect();
     let mut matches = rank(query, &texts);
 
@@ -377,451 +343,12 @@ fn visible_matches(query: &str, entries: &[PaletteEntry], chip: Option<&str>) ->
     matches
 }
 
-/// Draw the palette as a modal overlay. Returns the user's choice, if any.
-pub fn show(
-    ctx: &egui::Context,
-    state: &mut PaletteState,
-    entries: &[PaletteEntry],
-    config: &PaletteConfig<'_>,
-) -> PaletteOutcome {
-    if !state.open {
-        return PaletteOutcome::default();
-    }
-
-    let grouped = state.query.trim().is_empty();
-    let matches = visible_matches(&state.query, entries, state.chip.as_deref());
-
-    if state.selected >= matches.len() {
-        state.selected = matches.len().saturating_sub(1);
-    }
-
-    let screen = ctx.viewport_rect();
-    let position = egui::pos2(
-        (screen.center().x - PALETTE_WIDTH / 2.0).max(screen.left() + 8.0),
-        screen.top() + 76.0,
-    );
-    let modal_id = egui::Id::new(("leetr-palette", config.id));
-
-    // Keyboard navigation is read before the widgets so a single key press
-    // cannot both move the cursor and activate a row.
-    let (moved_up, moved_down, activate) = ctx.input(|i| {
-        (
-            i.key_pressed(Key::ArrowUp) || (i.key_pressed(Key::Tab) && i.modifiers.shift),
-            i.key_pressed(Key::ArrowDown) || (i.key_pressed(Key::Tab) && !i.modifiers.shift),
-            i.key_pressed(Key::Enter),
-        )
-    });
-
-    if moved_up && !matches.is_empty() {
-        state.selected = state.selected.checked_sub(1).unwrap_or(matches.len() - 1);
-        state.scroll_to_selection = true;
-    }
-    if moved_down && !matches.is_empty() {
-        state.selected = (state.selected + 1) % matches.len();
-        state.scroll_to_selection = true;
-    }
-
-    // A rounded, shadowed card with a borderless search field and an
-    // accent-tinted selection reads as a modern launcher rather than a stock
-    // egui popup.
-    let popup_frame = egui::Frame::popup(ctx.global_style().as_ref())
-        .corner_radius(egui::CornerRadius::same(14))
-        .inner_margin(Margin::ZERO)
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 12],
-            blur: 32,
-            spread: 0,
-            color: Color32::from_black_alpha(110),
-        });
-
-    let response = egui::Modal::new(modal_id)
-        .backdrop_color(Color32::from_black_alpha(150))
-        .frame(popup_frame)
-        .area(egui::Modal::default_area(modal_id).fixed_pos(position))
-        .show(ctx, |ui| {
-            let mut outcome = PaletteOutcome::default();
-            let mut empty_action_clicked = false;
-            let mut requested_chip: Option<Option<String>> = None;
-            ui.set_width(PALETTE_WIDTH);
-
-            let palette_colors = colors(ui.visuals().dark_mode);
-
-            // -- search -------------------------------------------------
-            let search = egui::Frame::NONE
-                .inner_margin(Margin::symmetric(16, 13))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let galley = ui.painter().layout_no_wrap(
-                            glyphs::SEARCH.to_owned(),
-                            FontId::monospace(14.0),
-                            ui.visuals().weak_text_color(),
-                        );
-                        let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
-                        ui.painter()
-                            .galley(rect.min, galley, ui.visuals().weak_text_color());
-                        ui.add_space(10.0);
-
-                        // Size the field so the key cap still fits on the right.
-                        let cap_size = config.search_badge.map(|text| key_cap_size(ui, text));
-                        let reserved = cap_size.map_or(0.0, |size| size.x + 10.0);
-                        let edit_width = (ui.available_width() - reserved).max(80.0);
-                        let edit = ui.add(
-                            TextEdit::singleline(&mut state.query)
-                                .id(modal_id.with("query"))
-                                .hint_text(RichText::new(config.placeholder).size(15.0))
-                                .frame(egui::Frame::NONE)
-                                .margin(Margin::ZERO)
-                                .font(FontId::proportional(15.0))
-                                .desired_width(edit_width),
-                        );
-                        if std::mem::take(&mut state.grab_focus) {
-                            edit.request_focus();
-                        }
-                        if edit.changed() {
-                            state.selected = 0;
-                        }
-
-                        if let (Some(text), Some(size)) = (config.search_badge, cap_size) {
-                            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-                            paint_key_cap(
-                                ui,
-                                rect,
-                                text,
-                                palette_colors.cap_border,
-                                palette_colors.cap_fill,
-                            );
-                        }
-                    });
-                });
-            ui.painter().hline(
-                search.response.rect.x_range(),
-                search.response.rect.bottom(),
-                Stroke::new(1.0, palette_colors.border),
-            );
-
-            // -- chips --------------------------------------------------
-            if !config.chips.is_empty() {
-                let chips = egui::Frame::NONE
-                    .inner_margin(Margin::symmetric(16, 10))
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                            for chip in &config.chips {
-                                // The chip with id "all" means "no filter", so it
-                                // reads as active whenever no chip is selected.
-                                let active = state
-                                    .chip
-                                    .as_deref()
-                                    .map_or(chip.id == "all", |current| current == chip.id);
-                                if chip_button(ui, &chip.label, active, &palette_colors).clicked() {
-                                    requested_chip = Some(if active || chip.id == "all" {
-                                        None
-                                    } else {
-                                        Some(chip.id.clone())
-                                    });
-                                }
-                            }
-                        });
-                    });
-                ui.painter().hline(
-                    chips.response.rect.x_range(),
-                    chips.response.rect.bottom(),
-                    Stroke::new(1.0, palette_colors.border),
-                );
-            }
-
-            if let Some(next) = requested_chip {
-                state.chip = next;
-                state.selected = 0;
-            }
-
-            // -- results ------------------------------------------------
-            egui::ScrollArea::vertical()
-                .max_height(LIST_HEIGHT)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add_space(6.0);
-
-                    if matches.is_empty() {
-                        ui.add_space(12.0);
-                        ui.vertical_centered(|ui| match config.empty_action {
-                            Some(label) => {
-                                if ui
-                                    .add(egui::Button::new(label).corner_radius(8.0))
-                                    .clicked()
-                                {
-                                    empty_action_clicked = true;
-                                }
-                            }
-                            None => {
-                                ui.label(RichText::new("No matches").weak());
-                            }
-                        });
-                        ui.add_space(12.0);
-                        return;
-                    }
-
-                    let mut last_section: Option<&str> = None;
-                    for (row, &entry_index) in matches.iter().enumerate().take(MAX_ROWS) {
-                        let entry = &entries[entry_index];
-
-                        if grouped {
-                            let section = entry.section.as_deref().unwrap_or("");
-                            if !section.is_empty() && last_section != Some(section) {
-                                if last_section.is_some() {
-                                    ui.add_space(8.0);
-                                }
-                                section_header(ui, section);
-                                last_section = Some(section);
-                            }
-                        }
-
-                        let is_selected = row == state.selected;
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), ROW_HEIGHT),
-                            egui::Sense::click(),
-                        );
-
-                        if ui.is_rect_visible(rect) {
-                            let pill = rect.shrink2(egui::vec2(6.0, 2.0));
-                            if is_selected {
-                                ui.painter().rect_filled(
-                                    pill,
-                                    CornerRadius::same(8),
-                                    palette_colors.selection_fill,
-                                );
-                            } else if response.hovered() {
-                                ui.painter().rect_filled(
-                                    pill,
-                                    CornerRadius::same(8),
-                                    palette_colors.hover_fill,
-                                );
-                            }
-
-                            let text_color = if is_selected {
-                                ui.visuals().strong_text_color()
-                            } else {
-                                ui.visuals().text_color()
-                            };
-                            let hint_color = ui.visuals().weak_text_color();
-                            let inner = rect.shrink2(egui::vec2(16.0, 0.0));
-
-                            // The trailing element is a shortcut key cap when the
-                            // row has one, otherwise the muted hint text.
-                            let hint_font = FontId::proportional(12.0);
-                            let cap_size =
-                                entry.shortcut.as_deref().map(|text| key_cap_size(ui, text));
-                            let hint_width = if let Some(size) = cap_size {
-                                size.x + 16.0
-                            } else if entry.hint.is_empty() {
-                                0.0
-                            } else {
-                                ui.painter()
-                                    .layout_no_wrap(
-                                        entry.hint.clone(),
-                                        hint_font.clone(),
-                                        hint_color,
-                                    )
-                                    .size()
-                                    .x
-                                    + 16.0
-                            };
-
-                            // The entry's icon carries real information — for
-                            // Ctrl+P it is the solved / attempted / todo marker.
-                            // NOTE: this must stay. An earlier rewrite of this
-                            // row dropped it and silently removed those markers;
-                            // no test caught it because nothing asserted painted
-                            // output, only that rendering did not panic.
-                            let mut label_left = inner.left();
-                            if let Some(icon) = entry.icon.as_deref() {
-                                let galley = ui.painter().layout_no_wrap(
-                                    icon.to_owned(),
-                                    FontId::monospace(14.0),
-                                    text_color,
-                                );
-                                let position = egui::pos2(
-                                    inner.left(),
-                                    inner.center().y - galley.size().y / 2.0,
-                                );
-                                label_left += galley.size().x + 8.0;
-                                ui.painter().galley(position, galley, text_color);
-                            }
-
-                            let label = ui.painter().layout(
-                                entry.label.clone(),
-                                FontId::proportional(14.5),
-                                text_color,
-                                (inner.width() - hint_width - (label_left - inner.left()))
-                                    .max(40.0),
-                            );
-                            ui.painter().galley(
-                                egui::pos2(label_left, inner.center().y - label.size().y / 2.0),
-                                label,
-                                text_color,
-                            );
-
-                            if let (Some(text), Some(size)) = (entry.shortcut.as_deref(), cap_size)
-                            {
-                                let cap = egui::Rect::from_min_size(
-                                    egui::pos2(
-                                        inner.right() - size.x,
-                                        inner.center().y - size.y / 2.0,
-                                    ),
-                                    size,
-                                );
-                                paint_key_cap(
-                                    ui,
-                                    cap,
-                                    text,
-                                    palette_colors.cap_border,
-                                    palette_colors.cap_fill,
-                                );
-                            } else if !entry.hint.is_empty() {
-                                ui.painter().text(
-                                    egui::pos2(inner.right(), inner.center().y),
-                                    Align2::RIGHT_CENTER,
-                                    &entry.hint,
-                                    hint_font,
-                                    hint_color,
-                                );
-                            }
-                        }
-
-                        if is_selected && state.scroll_to_selection {
-                            response.scroll_to_me(Some(egui::Align::Center));
-                        }
-                        if response.clicked() {
-                            outcome.chosen = Some(entry_index);
-                        }
-                    }
-
-                    ui.add_space(6.0);
-                });
-
-            state.scroll_to_selection = false;
-
-            if activate {
-                if let Some(&entry_index) = matches.get(state.selected) {
-                    outcome.chosen = Some(entry_index);
-                }
-            }
-            if empty_action_clicked
-                || (activate && matches.is_empty() && config.empty_action.is_some())
-            {
-                outcome.empty_action = true;
-            }
-
-            // -- footer ------------------------------------------------
-            let footer = egui::Frame::NONE
-                .inner_margin(Margin::symmetric(16, 10))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let hint = RichText::new("Up/Down navigate · Enter select · Esc close")
-                            .weak()
-                            .small();
-                        ui.label(hint);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{} of {}", matches.len(), entries.len()))
-                                    .weak()
-                                    .small(),
-                            );
-                        });
-                    });
-                });
-            ui.painter().hline(
-                footer.response.rect.x_range(),
-                footer.response.rect.top(),
-                Stroke::new(1.0, palette_colors.border),
-            );
-
-            outcome
-        });
-
-    let should_close = response.should_close();
-    let mut outcome = response.inner;
-    if should_close {
-        outcome.closed = true;
-    }
-    if outcome.closed {
-        state.close();
-    }
-    outcome
-}
-
-/// One filter chip.
-fn chip_button(ui: &mut egui::Ui, label: &str, active: bool, colors: &Colors) -> egui::Response {
-    let text_color = if active {
-        ui.visuals().strong_text_color()
-    } else {
-        ui.visuals().text_color()
-    };
-
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), FontId::proportional(12.5), text_color);
-    let size = egui::vec2(galley.size().x + 22.0, 26.0);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-
-    if ui.is_rect_visible(rect) {
-        let fill = if active {
-            colors.chip_active_fill
-        } else {
-            colors.chip_fill
-        };
-        let border = if active {
-            ui.visuals().selection.stroke.color
-        } else {
-            colors.chip_border
-        };
-        let radius = CornerRadius::same(7);
-        ui.painter().rect_filled(rect, radius, fill);
-        ui.painter()
-            .rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
-        ui.painter().galley(
-            egui::pos2(
-                rect.center().x - galley.size().x / 2.0,
-                rect.center().y - galley.size().y / 2.0,
-            ),
-            galley,
-            text_color,
-        );
-    }
-
-    response
-}
-
-/// A small-caps section heading.
-fn section_header(ui: &mut egui::Ui, section: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    ui.painter().text(
-        egui::pos2(rect.left() + 16.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        section.to_uppercase(),
-        FontId::proportional(11.0),
-        ui.visuals().weak_text_color(),
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glyphs;
 
     fn entry(label: &str, hint: &str) -> PaletteEntry {
         PaletteEntry::new(label).with_hint(hint)
-    }
-
-    fn config(id: &str) -> PaletteConfig<'_> {
-        PaletteConfig {
-            id,
-            placeholder: "Search…",
-            ..PaletteConfig::default()
-        }
     }
 
     #[test]
@@ -995,134 +522,23 @@ mod tests {
     }
 
     #[test]
-    fn palette_renders_without_panicking() {
-        let entries = vec![
-            entry("Toggle theme", "Dark → Light").with_icon(glyphs::MOON),
-            entry("Refresh problems", ""),
-        ];
-        let ctx = egui::Context::default();
-        let mut state = PaletteState::default();
-
-        for query in ["", "theme", "zzzz"] {
-            state.open();
-            state.query = query.to_string();
-            let mut output = ctx.run_ui(Default::default(), |_ui| {
-                let outcome = show(&ctx, &mut state, &entries, &config("test"));
-                assert!(outcome.chosen.is_none(), "nothing should be chosen");
-            });
-            output.textures_delta.clear();
-        }
-    }
-
-    #[test]
-    fn palette_renders_with_chips_sections_and_shortcuts() {
-        let entries = vec![
-            entry("1. Two Sum", "Easy · solved")
-                .with_icon(glyphs::SOLVED)
-                .with_section("Solved")
-                .with_tags(["easy", "solved"]),
-            entry("4. Median", "Hard · todo")
-                .with_icon(glyphs::TODO)
-                .with_section("Todo")
-                .with_tags(["hard", "todo"]),
-            PaletteEntry::new("Quit Leetr")
-                .with_section("App")
-                .with_shortcut("Ctrl Q"),
-        ];
-        let chips = vec![
-            PaletteChip::new("all", "All"),
-            PaletteChip::new("easy", "Easy"),
-            PaletteChip::new("solved", "Solved"),
-        ];
-        let cfg = PaletteConfig {
-            id: "problems",
-            placeholder: "Jump to a problem…",
-            search_badge: Some("Ctrl P"),
-            chips,
-            empty_action: None,
-        };
-
-        let ctx = egui::Context::default();
-        let mut state = PaletteState::default();
-
-        for chip in [None, Some("easy".to_string()), Some("solved".to_string())] {
-            state.open();
-            state.chip = chip;
-            let mut output = ctx.run_ui(Default::default(), |_ui| {
-                let _ = show(&ctx, &mut state, &entries, &cfg);
-            });
-            output.textures_delta.clear();
-        }
-    }
-
-    fn key_event(key: Key) -> egui::RawInput {
-        egui::RawInput {
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn enter_selects_the_top_match() {
-        let entries = vec![
-            entry("Toggle theme", "switch to Light mode"),
-            entry("Quit Leetr", ""),
-        ];
-        let ctx = egui::Context::default();
+    fn navigation_wraps_around_the_visible_rows() {
         let mut state = PaletteState::default();
         state.open();
-        state.query = "theme".into();
-
-        let mut chosen = None;
-        let mut output = ctx.run_ui(key_event(Key::Enter), |_ui| {
-            chosen = show(&ctx, &mut state, &entries, &config("t")).chosen;
-        });
-        output.textures_delta.clear();
-
-        assert_eq!(chosen, Some(0), "Enter must activate the highlighted row");
-    }
-
-    #[test]
-    fn arrow_keys_move_the_selection() {
-        let entries = vec![entry("alpha", ""), entry("beta", ""), entry("gamma", "")];
-        let ctx = egui::Context::default();
-        let mut state = PaletteState::default();
-        state.open();
-
-        let mut output = ctx.run_ui(key_event(Key::ArrowDown), |_ui| {
-            show(&ctx, &mut state, &entries, &config("t"));
-        });
-        output.textures_delta.clear();
-        assert_eq!(state.selected, 1);
-
-        let mut output = ctx.run_ui(key_event(Key::ArrowUp), |_ui| {
-            show(&ctx, &mut state, &entries, &config("t"));
-        });
-        output.textures_delta.clear();
-        assert_eq!(state.selected, 0);
-    }
-
-    #[test]
-    fn closing_clears_the_state() {
-        let entries = vec![entry("Quit", "")];
-        let ctx = egui::Context::default();
-        let mut state = PaletteState::default();
-        state.open();
-
-        let mut output = ctx.run_ui(Default::default(), |_ui| {
-            let mut outcome = show(&ctx, &mut state, &entries, &config("test"));
-            outcome.closed = true;
-            if outcome.closed {
-                state.close();
-            }
-        });
-        output.textures_delta.clear();
-        assert!(!state.is_open());
+        state.move_next(3);
+        assert_eq!(state.selected(), 1);
+        state.move_next(3);
+        state.move_next(3);
+        assert_eq!(state.selected(), 0);
+        state.move_prev(3);
+        assert_eq!(state.selected(), 2);
+        state.set_query("two".into());
+        assert_eq!(state.query(), "two");
+        assert_eq!(state.selected(), 0);
+        state.set_chip(Some("easy".into()));
+        assert_eq!(state.active_chip(), Some("easy"));
+        state.clamp_selection(1);
+        state.move_next(0);
+        state.move_prev(0);
     }
 }

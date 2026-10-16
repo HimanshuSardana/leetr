@@ -158,6 +158,36 @@ fn authenticated_session_can_read_the_solved_set() {
     assert!(solved_page.total as usize == solved.len());
 }
 
+/// Statement diagrams must be fetchable through the same client GPUI uses for
+/// `img(..)`.
+///
+/// Without this, a statement with a diagram shows the fallback and nothing
+/// fails — the renderer cannot tell "no image in the statement" from "the
+/// image client is broken".
+#[test]
+#[ignore = "hits the live LeetCode API"]
+fn statement_images_load_through_the_blocking_client() {
+    let detail = public_client()
+        .fetch_question("add-two-numbers")
+        .expect("question");
+    let blocks = html::parse(&detail.content_html);
+    let url = blocks
+        .iter()
+        .find_map(|block| match block {
+            leetr::leetcode::html::Block::Image { url, .. } => Some(url.clone()),
+            _ => None,
+        })
+        .expect("add-two-numbers carries a diagram the prose refers to");
+
+    let client = leetr::img::BlockingHttpClient::new().expect("image client");
+    let bytes = client.get_bytes(&url).expect("image bytes");
+    assert!(
+        bytes.len() > 1_000,
+        "{url} returned only {} bytes",
+        bytes.len()
+    );
+}
+
 /// Drives the real statement pane with real content, headlessly.
 #[test]
 #[ignore = "hits the live LeetCode API"]
@@ -170,11 +200,12 @@ fn statement_pane_renders_real_content() {
         blocks.len()
     );
 
-    let ctx = egui::Context::default();
-    let mut output = ctx.run_ui(Default::default(), |ui| {
-        leetr::ui::statement::show(ui, Some(&detail), &blocks, false, None);
-    });
-    output.textures_delta.clear();
+    let text = leetr::ui::statement::blocks_text(&blocks);
+    assert!(text.len() > 100, "expected a rich statement, got {text:?}");
+    assert_eq!(
+        leetr::ui::statement::title_line(&detail),
+        format!("{}. {}", detail.frontend_id, detail.title)
+    );
 }
 
 /// Drives the real problem-list pane against a page of live problems.
@@ -184,30 +215,10 @@ fn problem_list_pane_renders_real_content() {
     let page = public_client()
         .fetch_problems(&ProblemQuery::new(25))
         .expect("problem list");
-    let mut state = leetr::ui::problem_list::ProblemListState::default();
-    let header = leetr::ui::problem_list::Header {
-        session: "browse-only",
-        session_color: None,
-        theme: leetr::theme::Theme::Dark,
-    };
-
-    let ctx = egui::Context::default();
-    let mut output = ctx.run_ui(Default::default(), |ui| {
-        let _ = leetr::ui::problem_list::show(
-            ui,
-            &mut state,
-            &header,
-            &page.problems,
-            page.total,
-            false,
-            None,
-            true,
-            Some(page.problems[0].slug.as_str()),
-        );
-    });
-    output.textures_delta.clear();
-
+    let state = leetr::ui::problem_list::ProblemListState::default();
     assert_eq!(state.matching(&page.problems).len(), page.problems.len());
+    let hover = leetr::ui::problem_list::hover_text(&page.problems[0]);
+    assert!(hover.contains(&page.problems[0].title));
 }
 
 // ---------------------------------------------------------------------------

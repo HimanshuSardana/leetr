@@ -1,34 +1,30 @@
 //! Colour schemes.
 //!
 //! Leetr ships a curated **dark mode** (the default for a coding tool) and a
-//! matching light mode. Both are applied to the whole `egui` context so every
-//! panel, popup and widget — including future command palettes — picks them up.
+//! matching light mode. On GPUI Kit these map onto the component library's
+//! [`ThemeMode`](gpui_kit::component::theme::ThemeMode); the hex constants
+//! below drive Leetr-specific accents (difficulty badges, verdict colours).
 
-use egui::style::Selection;
-use egui::{Color32, Stroke, Visuals};
 use serde::{Deserialize, Serialize};
 
 use crate::model::Difficulty;
 
 /// LeetCode's signature orange, used as the accent colour in both themes.
-pub const ACCENT: Color32 = Color32::from_rgb(0xff, 0xa1, 0x16);
-
+pub const ACCENT_HEX: u32 = 0xFFA116;
 /// Green used for accepted verdicts and success states.
-pub const SUCCESS: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
-
+pub const SUCCESS_HEX: u32 = 0x3FB950;
 /// Red used for errors and rejected verdicts.
-pub const DANGER: Color32 = Color32::from_rgb(0xe5, 0x53, 0x4b);
-
+pub const DANGER_HEX: u32 = 0xE5534B;
 /// Yellow used for warnings.
-pub const WARNING: Color32 = Color32::from_rgb(0xd2, 0x99, 0x22);
+pub const WARNING_HEX: u32 = 0xD29922;
 
-/// Colour used for a problem's difficulty badge.
-pub fn difficulty_color(difficulty: Difficulty) -> Color32 {
+/// Colour used for a problem's difficulty badge, as a packed `0xRRGGBB`.
+pub fn difficulty_hex(difficulty: Difficulty) -> u32 {
     match difficulty {
-        Difficulty::Easy => Color32::from_rgb(0x2c, 0xbb, 0x8a),
-        Difficulty::Medium => Color32::from_rgb(0xe8, 0xb3, 0x39),
-        Difficulty::Hard => Color32::from_rgb(0xef, 0x4a, 0x4a),
-        Difficulty::Unknown => Color32::from_rgb(0x8a, 0x8f, 0x98),
+        Difficulty::Easy => 0x2CBB8A,
+        Difficulty::Medium => 0xE8B339,
+        Difficulty::Hard => 0xEF4A4A,
+        Difficulty::Unknown => 0x8A8F98,
     }
 }
 
@@ -68,131 +64,31 @@ impl Theme {
         }
     }
 
-    /// Apply this theme to the whole egui context.
-    ///
-    /// Both themes' visuals are (re)installed so a later switch is instant, then
-    /// the preference is set to the chosen one.
-    pub fn apply(self, ctx: &egui::Context) {
-        ctx.set_visuals_of(egui::Theme::Dark, dark_visuals());
-        ctx.set_visuals_of(egui::Theme::Light, light_visuals());
-        ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            style.spacing.button_padding = egui::vec2(8.0, 4.0);
-            style.spacing.interact_size = egui::vec2(28.0, 24.0);
-        });
-        ctx.set_theme(match self {
-            Self::Dark => egui::ThemePreference::Dark,
-            Self::Light => egui::ThemePreference::Light,
-        });
+    /// Corresponding GPUI window appearance, so the OS chrome matches.
+    pub fn appearance(self) -> gpui_kit::WindowAppearance {
+        match self {
+            Self::Dark => gpui_kit::WindowAppearance::Dark,
+            Self::Light => gpui_kit::WindowAppearance::Light,
+        }
+    }
+
+    /// Corresponding gpui-component theme mode.
+    pub fn mode(self) -> gpui_kit::component::theme::ThemeMode {
+        match self {
+            Self::Dark => gpui_kit::component::theme::ThemeMode::Dark,
+            Self::Light => gpui_kit::component::theme::ThemeMode::Light,
+        }
+    }
+
+    /// Apply this theme to the running GPUI app.
+    pub fn apply(self, cx: &mut gpui_kit::App) {
+        gpui_kit::component::theme::Theme::change(self.mode(), None, cx);
     }
 }
 
-fn dark_visuals() -> Visuals {
-    let background = Color32::from_rgb(0x17, 0x19, 0x1d);
-    let surface = Color32::from_rgb(0x1f, 0x22, 0x27);
-    let raised = Color32::from_rgb(0x27, 0x2b, 0x32);
-    let hovered = Color32::from_rgb(0x32, 0x37, 0x3f);
-    let active = Color32::from_rgb(0x3d, 0x43, 0x4d);
-    let border = Color32::from_rgb(0x2d, 0x32, 0x39);
-    let sunken = Color32::from_rgb(0x10, 0x12, 0x15);
-    let text = Color32::from_rgb(0xdd, 0xe1, 0xe6);
-    let weak_text = Color32::from_rgb(0x97, 0x9e, 0xa9);
-
-    let mut v = Visuals::dark();
-    v.dark_mode = true;
-    v.panel_fill = background;
-    v.window_fill = surface;
-    v.faint_bg_color = surface;
-    v.extreme_bg_color = sunken;
-    v.text_edit_bg_color = Some(sunken);
-    v.code_bg_color = Color32::from_rgb(0x12, 0x14, 0x17);
-    v.weak_text_color = Some(weak_text);
-    v.hyperlink_color = ACCENT;
-    v.window_stroke = Stroke::new(1.0, border);
-    v.selection = Selection {
-        bg_fill: Color32::from_rgb(0x2b, 0x47, 0x69),
-        stroke: Stroke::new(1.0, ACCENT),
-    };
-
-    v.widgets.noninteractive.bg_fill = surface;
-    v.widgets.noninteractive.weak_bg_fill = surface;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
-
-    v.widgets.inactive.bg_fill = raised;
-    v.widgets.inactive.weak_bg_fill = raised;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
-
-    v.widgets.hovered.bg_fill = hovered;
-    v.widgets.hovered.weak_bg_fill = hovered;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.65));
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-
-    v.widgets.active.bg_fill = active;
-    v.widgets.active.weak_bg_fill = active;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-
-    v.widgets.open.bg_fill = surface;
-    v.widgets.open.weak_bg_fill = surface;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, border);
-
-    v
-}
-
-fn light_visuals() -> Visuals {
-    let background = Color32::from_rgb(0xf7, 0xf8, 0xfa);
-    let surface = Color32::WHITE;
-    let raised = Color32::from_rgb(0xed, 0xef, 0xf2);
-    let hovered = Color32::from_rgb(0xe3, 0xe6, 0xea);
-    let active = Color32::from_rgb(0xd6, 0xda, 0xe0);
-    let border = Color32::from_rgb(0xd3, 0xd7, 0xdd);
-    let text = Color32::from_rgb(0x1c, 0x1f, 0x24);
-    let weak_text = Color32::from_rgb(0x5f, 0x67, 0x72);
-
-    let mut v = Visuals::light();
-    v.dark_mode = false;
-    v.panel_fill = background;
-    v.window_fill = surface;
-    v.faint_bg_color = Color32::from_rgb(0xf0, 0xf2, 0xf5);
-    v.extreme_bg_color = surface;
-    v.text_edit_bg_color = Some(surface);
-    v.code_bg_color = Color32::from_rgb(0xf2, 0xf3, 0xf5);
-    v.weak_text_color = Some(weak_text);
-    // Darker orange so links stay legible on white.
-    v.hyperlink_color = Color32::from_rgb(0xb2, 0x6a, 0x00);
-    v.window_stroke = Stroke::new(1.0, border);
-    v.selection = Selection {
-        bg_fill: Color32::from_rgb(0xbb, 0xd6, 0xfb),
-        stroke: Stroke::new(1.0, Color32::from_rgb(0xb2, 0x6a, 0x00)),
-    };
-
-    v.widgets.noninteractive.bg_fill = surface;
-    v.widgets.noninteractive.weak_bg_fill = surface;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
-
-    v.widgets.inactive.bg_fill = raised;
-    v.widgets.inactive.weak_bg_fill = raised;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
-
-    v.widgets.hovered.bg_fill = hovered;
-    v.widgets.hovered.weak_bg_fill = hovered;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xb2, 0x6a, 0x00));
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
-
-    v.widgets.active.bg_fill = active;
-    v.widgets.active.weak_bg_fill = active;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xb2, 0x6a, 0x00));
-    v.widgets.active.fg_stroke = Stroke::new(1.0, text);
-
-    v.widgets.open.bg_fill = surface;
-    v.widgets.open.weak_bg_fill = surface;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, border);
-
-    v
+/// Convert a packed `0xRRGGBB` into a GPUI colour.
+pub fn rgb(hex: u32) -> gpui_kit::Rgba {
+    gpui_kit::rgb(hex)
 }
 
 #[cfg(test)]
@@ -220,26 +116,12 @@ mod tests {
     }
 
     #[test]
-    fn every_theme_has_contrasting_visuals() {
-        let dark = dark_visuals();
-        let light = light_visuals();
-        assert!(dark.dark_mode);
-        assert!(!light.dark_mode);
-        assert_ne!(dark.panel_fill, light.panel_fill);
-        assert_ne!(dark.widgets.noninteractive.fg_stroke.color, dark.panel_fill);
-        assert_ne!(
-            light.widgets.noninteractive.fg_stroke.color,
-            light.panel_fill
-        );
-    }
-
-    #[test]
     fn difficulty_colours_are_distinct() {
         let colours = [
-            difficulty_color(Difficulty::Easy),
-            difficulty_color(Difficulty::Medium),
-            difficulty_color(Difficulty::Hard),
-            difficulty_color(Difficulty::Unknown),
+            difficulty_hex(Difficulty::Easy),
+            difficulty_hex(Difficulty::Medium),
+            difficulty_hex(Difficulty::Hard),
+            difficulty_hex(Difficulty::Unknown),
         ];
         for (i, a) in colours.iter().enumerate() {
             for b in colours.iter().skip(i + 1) {

@@ -1,29 +1,74 @@
-//! The `eframe` application: top-level state, panel layout and background work.
+//! The GPUI application: top-level state, layout and background work.
+//!
+//! Leetr's UI is a retained-mode tree built with
+//! [GPUI Kit](https://gpui-kit.com/): [`Button`], [`Input`], [`Textarea`],
+//! [`TabBar`]/[`Tab`] and [`Spinner`] from `gpui-component`, laid out with
+//! plain GPUI `div`s. Everything that is not rendering — the LeetCode client,
+//! workspace files, nvim integration and the loopback control API — is shared
+//! with the CLI and untouched by this module.
+//!
+//! Network calls never block the UI thread: jobs run on plain `std::thread`s
+//! (see [`crate::bg`]) and a lightweight timer applies their results to the
+//! view, which is GPUI's moral equivalent of the old per-frame drain.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
-use eframe::egui;
-
-use std::sync::Arc;
+use gpui_kit::base::Selectable;
+use gpui_kit::component::button::Button;
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::sidebar::{
+    Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenuItem, SidebarToggleButton,
+};
+use gpui_kit::component::{ActiveTheme as _, Icon};
+// The complete Lucide catalog ships with the assets crate; the component's own
+// `IconName` is only the small legacy subset.
+use gpui_kit::assets::IconName;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tab::{Tab as KitTab, TabBar};
+use gpui_kit::component::theme::Theme as KitTheme;
+use gpui_kit::component::IndexPath;
+use gpui_kit::prelude::*;
+use gpui_kit::Focusable;
+use gpui_kit::{
+    div, img, px, rgb, AnyElement, App, ClickEvent, Context, Entity, FontWeight, IntoElement,
+    KeyBinding, ObjectFit, Render, SharedString, Subscription, TitlebarOptions, Window,
+    WindowOptions,
+};
 
 use crate::bg::Bg;
 use crate::config::{self, Config, Credentials};
 use crate::editor::{Buffer as EditorBuffer, Workspace};
-use crate::glyphs;
 use crate::interop::{self, Command as InteropCommand, Shared as InteropShared, Snapshot};
 use crate::leetcode::client::ProblemQuery;
-use crate::leetcode::html::{self, Block};
+use crate::leetcode::html::{self, Block, SpanStyle};
 use crate::leetcode::submit::submission_policy;
 use crate::leetcode::{JudgeResult, LeetCodeClient, SubmitDecision, Verdict};
-use crate::model::{Problem, ProblemPage, QuestionDetail, UserStatus};
+use crate::model::{Difficulty, Problem, ProblemPage, ProblemStatus, QuestionDetail, UserStatus};
 use crate::nvim;
-use crate::theme::Theme;
-use crate::ui;
+use crate::theme;
 use crate::ui::code_editor::{self, JudgeView, LanguageChoice};
-use crate::ui::palette::{PaletteEntry, PaletteOutcome, PaletteState};
-use crate::ui::problem_list::{ProblemListAction, ProblemListState};
+use crate::ui::palette::{self, PaletteEntry, MAX_ROWS};
+use crate::ui::problem_list::ProblemListState;
+use crate::ui::statement;
 use crate::ui::status_bar::AuthBadge;
+
+gpui_kit::actions!(
+    leetr,
+    [
+        Quit,
+        ToggleTheme,
+        ActionPalette,
+        ProblemPalette,
+        CloseOverlay,
+        OpenInNvim,
+        RunTests,
+        SubmitSolution,
+        ToggleSidebar,
+    ]
+);
 
 /// Background jobs report `Result`s with `String` errors so they stay `Send`.
 type Job<T> = Result<T, String>;
@@ -58,8 +103,26 @@ pub enum Tab {
     Code,
 }
 
+/// Which command palette is open. [`Command`] owns the query, the filter and
+/// the highlight; the view supplies ranked rows and applies choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteKind {
+    Actions,
+    Problems,
+}
+
+/// One problem row offered by the problem palette.
+#[derive(Debug, Clone)]
+struct ProblemRow {
+    slug: String,
+    label: String,
+}
+
 /// Cap on how many loaded problems the `Ctrl+P` palette will offer.
 const MAX_PALETTE_PROBLEMS: usize = 1500;
+
+/// How many problem rows render before "show more" is needed.
+const ROW_PAGE: usize = 200;
 
 /// Things the `Ctrl+K` palette can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,27 +177,8 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Quit,
 ];
 
-/// One row of the `Ctrl+K` catalog: action, hint, icon, section, shortcut and
-/// whether it applies right now.
-type ActionRow = (
-    Action,
-    String,
-    &'static str,
-    &'static str,
-    Option<&'static str>,
-    bool,
-);
-
-/// Reduce a palette outcome to a chosen row index.
-///
-/// Choosing a row (or dismissing the palette) always closes it, so the palette
-/// never lingers after the user has acted.
-fn resolve_palette_choice(state: &mut PaletteState, outcome: &PaletteOutcome) -> Option<usize> {
-    if outcome.chosen.is_some() || outcome.closed {
-        state.close();
-    }
-    outcome.chosen
-}
+/// One row of the `Ctrl+K` catalog: action, hint, section and shortcut.
+type ActionRow = (Action, String, &'static str, Option<&'static str>);
 
 /// Transport form of the auth badge, for the control API.
 fn auth_state_of(badge: &AuthBadge) -> interop::AuthState {
@@ -170,7 +214,7 @@ fn auth_badge_for(
 }
 
 /// The compact session line shown under the app name in the problem panel.
-fn session_line(badge: &AuthBadge) -> (String, Option<egui::Color32>) {
+fn session_line(badge: &AuthBadge) -> (String, Option<u32>) {
     match badge {
         AuthBadge::SignedIn { username, solved } => {
             let text = if username.is_empty() {
@@ -178,22 +222,30 @@ fn session_line(badge: &AuthBadge) -> (String, Option<egui::Color32>) {
             } else {
                 format!("{username} · {solved} solved")
             };
-            (text, Some(crate::theme::SUCCESS))
+            (text, Some(theme::SUCCESS_HEX))
         }
-        AuthBadge::Rejected => ("session rejected".to_string(), Some(crate::theme::DANGER)),
+        AuthBadge::Rejected => ("session rejected".to_string(), Some(theme::DANGER_HEX)),
         AuthBadge::Checking => ("checking session…".to_string(), None),
-        AuthBadge::BrowseOnly => ("browse-only".to_string(), Some(crate::theme::WARNING)),
+        AuthBadge::BrowseOnly => ("browse-only".to_string(), Some(theme::WARNING_HEX)),
     }
 }
 
-/// Should a plain `Tab` switch from the statement pane to the code pane?
+/// Highlight language for the solution editor, from a LeetCode language slug.
 ///
-/// Tab is the standard "move focus" key, so it only doubles as a pane switch
-/// when nothing has keyboard focus. Without the second condition, pressing Tab
-/// while typing in the problem filter teleports the user to the code pane
-/// mid-query (verified in the GUI: 31,699 pixels of view change).
-fn tab_switches_panes(current: Tab, nothing_focused: bool) -> bool {
-    current == Tab::Statement && nothing_focused
+/// Only the Python and C++ grammars are compiled in, so every other language —
+/// and every unknown slug — decodes as plain text. The returned name must be a
+/// name the language registry knows, or the editor would treat it as garbage
+/// rather than as unhighlighted code; `text` is the registry's plain-text
+/// language, and a test pins that.
+///
+/// C is highlighted with the C++ grammar: it is a superset that parses C, and
+/// the alternative is no highlighting at all for a common LeetCode language.
+pub fn editor_language(lang_slug: &str) -> &'static str {
+    match lang_slug {
+        "python" | "python3" | "py" | "pythondata" | "pandas" => "python",
+        "cpp" | "c++" | "c" => "cpp",
+        _ => "text",
+    }
 }
 
 /// Canonical URL for a problem.
@@ -225,49 +277,20 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     Err(format!("could not find a browser opener for {url}"))
 }
 
-pub struct LeetrApp {
-    pub config: Config,
-    pub credentials: Credentials,
-    pub status: String,
-    pub error: Option<String>,
-
+/// Non-UI state assembled before the GPUI application starts.
+struct Bootstrap {
+    config: Config,
+    credentials: Credentials,
+    status: String,
+    error: Option<String>,
     client: LeetCodeClient,
-    bg: Bg<ApiEvent>,
-
-    problems: Vec<Problem>,
-    total: u32,
-    list_state: ProblemListState,
-    list_loading: bool,
-    list_error: Option<String>,
-
-    selected: Option<String>,
-    detail: Option<QuestionDetail>,
-    detail_blocks: Vec<Block>,
-    detail_loading: bool,
-    detail_error: Option<String>,
-
-    user: Option<UserStatus>,
-    solved: BTreeSet<String>,
-
-    actions_palette: PaletteState,
-    problems_palette: PaletteState,
-
     workspace: Workspace,
-    code: Option<EditorBuffer>,
-    languages: Vec<LanguageChoice>,
-    tab: Tab,
-    reloaded_from_disk: bool,
-    sidebar_collapsed: bool,
-    /// Code pushed over the API before its problem finished loading.
-    pending_code: Option<String>,
-    judge: Option<JudgeView>,
-
     interop_shared: Arc<InteropShared>,
     interop: Option<interop::RunningServer>,
 }
 
-impl LeetrApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+impl Bootstrap {
+    fn load() -> Self {
         let mut error = None;
         if let Err(err) = config::seed() {
             error = Some(format!("could not write config files: {err}"));
@@ -279,18 +302,10 @@ impl LeetrApp {
         });
         let credentials = Credentials::load();
 
-        // Restore the persisted colour scheme before the first frame.
-        config.theme.apply(&cc.egui_ctx);
-
-        // Draw the whole interface in Iosevka Nerd Font when it is installed.
-        crate::fonts::install(&cc.egui_ctx);
-
         let client = match LeetCodeClient::new(credentials.clone()) {
             Ok(client) => client,
             Err(err) => {
                 error = Some(format!("could not build the HTTP client: {err}"));
-                // `with_base_url` only fails if TLS setup fails, which cannot
-                // happen with rustls defaults; fall back to an unusable client.
                 LeetCodeClient::new(Credentials::default()).expect("default client")
             }
         };
@@ -319,25 +334,150 @@ impl LeetrApp {
             }
         };
 
-        // Wake the UI whenever the control API queues a command: egui only runs
-        // a frame when asked to, so an idle app would never apply them.
-        {
-            let ctx = cc.egui_ctx.clone();
-            interop_shared.set_waker(Arc::new(move || ctx.request_repaint()));
-        }
-
-        let mut app = Self {
+        Self {
             config,
             credentials,
             status: "Loading problems…".to_string(),
             error,
             client,
+            workspace,
+            interop_shared,
+            interop,
+        }
+    }
+}
+
+/// The root GPUI view: all former `eframe` state, rendered with GPUI Kit.
+pub struct LeetrView {
+    config: Config,
+    credentials: Credentials,
+    status: String,
+    error: Option<String>,
+
+    client: LeetCodeClient,
+    bg: Bg<ApiEvent>,
+
+    problems: Vec<Problem>,
+    total: u32,
+    list_state: ProblemListState,
+    list_loading: bool,
+    list_error: Option<String>,
+    row_cap: usize,
+
+    selected: Option<String>,
+    detail: Option<QuestionDetail>,
+    detail_blocks: Vec<Block>,
+    detail_loading: bool,
+    detail_error: Option<String>,
+
+    user: Option<UserStatus>,
+    solved: BTreeSet<String>,
+
+    actions_cmd: Entity<CommandState>,
+    problems_cmd: Entity<CommandState>,
+    /// Which command palette is open, if any.
+    open_palette: Option<PaletteKind>,
+    /// A global shortcut asked for a palette. Opening one focuses its field,
+    /// and focusing needs a `Window`, which an action listener does not get —
+    /// so the request is applied on the next paint.
+    pending_palette: Option<PaletteKind>,
+
+    workspace: Workspace,
+    code: Option<EditorBuffer>,
+    languages: Vec<LanguageChoice>,
+    tab: Tab,
+    pending_code: Option<String>,
+    judge: Option<JudgeView>,
+
+    interop_shared: Arc<InteropShared>,
+    interop: Option<interop::RunningServer>,
+
+    search_input: Entity<InputState>,
+    code_input: Entity<EditorState>,
+    /// LeetCode slug the solution editor is highlighting as.
+    editor_lang_slug: String,
+    /// Language requested without a window (control API); applied on next paint.
+    pending_lang: Option<String>,
+    _subscriptions: Vec<Subscription>,
+    /// Text waiting to be pushed into the solution field on the next paint.
+    code_input_needs_sync: Option<String>,
+    /// Set by the Quit action row; the render loop turns it into `cx.quit()`.
+    quit_requested: bool,
+    /// The problem sidebar is hidden.
+    sidebar_collapsed: bool,
+}
+
+impl LeetrView {
+    fn new(
+        bootstrap: Bootstrap,
+        search_input: Entity<InputState>,
+        actions_cmd: Entity<CommandState>,
+        problems_cmd: Entity<CommandState>,
+        code_input: Entity<EditorState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Keep the search field and the filter model in sync.
+        let search_sub = cx.subscribe(
+            &search_input,
+            |this: &mut Self, emitter, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.list_state.search = emitter.read(cx).value().to_string();
+                    this.row_cap = ROW_PAGE;
+                    cx.notify();
+                }
+            },
+        );
+        // Edits in the solution editor flow into the workspace file, which is
+        // the source of truth shared with nvim.
+        let code_sub = cx.subscribe(
+            &code_input,
+            |this: &mut Self, emitter, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = emitter.read(cx).value().to_string();
+                    if let Some(buffer) = this.code.as_mut() {
+                        buffer.set_text(text);
+                        if let Err(err) = buffer.save() {
+                            this.error = Some(format!("could not save the solution: {err}"));
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+        );
+
+        // Background threads post into `bg`; this timer applies their results
+        // on the UI thread, replacing the old per-frame drain.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let Some(view) = this.upgrade() else {
+                break;
+            };
+            view.update(cx, |view, cx| {
+                view.drain_events();
+                view.apply_interop_commands();
+                view.poll_workspace_file();
+                view.publish_snapshot();
+                cx.notify();
+            });
+        })
+        .detach();
+
+        let default_lang = bootstrap.config.default_language.clone();
+        let mut view = Self {
+            config: bootstrap.config,
+            credentials: bootstrap.credentials,
+            status: bootstrap.status,
+            error: bootstrap.error,
+            client: bootstrap.client,
             bg: Bg::new(),
             problems: Vec::new(),
             total: 0,
             list_state: ProblemListState::default(),
             list_loading: false,
             list_error: None,
+            row_cap: ROW_PAGE,
             selected: None,
             detail: None,
             detail_blocks: Vec::new(),
@@ -345,23 +485,31 @@ impl LeetrApp {
             detail_error: None,
             user: None,
             solved: BTreeSet::new(),
-            actions_palette: PaletteState::default(),
-            problems_palette: PaletteState::default(),
-            workspace,
+            actions_cmd,
+            problems_cmd,
+            open_palette: None,
+            pending_palette: None,
+            workspace: bootstrap.workspace,
             code: None,
             languages: Vec::new(),
             tab: Tab::Statement,
-            sidebar_collapsed: false,
-            reloaded_from_disk: false,
             pending_code: None,
             judge: None,
-            interop_shared,
-            interop,
+            interop_shared: bootstrap.interop_shared,
+            interop: bootstrap.interop,
+            search_input,
+            code_input,
+            editor_lang_slug: default_lang,
+            pending_lang: None,
+            _subscriptions: vec![search_sub, code_sub],
+            code_input_needs_sync: None,
+            quit_requested: false,
+            sidebar_collapsed: false,
         };
 
-        app.refresh_session();
-        app.load_first_page();
-        app
+        view.refresh_session();
+        view.load_first_page();
+        view
     }
 
     // -- background work ----------------------------------------------------
@@ -381,22 +529,24 @@ impl LeetrApp {
         });
     }
 
-    fn spawn_problems(&mut self, skip: u32, overwrite: bool) {
-        if overwrite {
-            self.problems.clear();
-            self.total = 0;
-        }
+    fn spawn_problems(&mut self, skip: u32, replace: bool) {
         self.list_loading = true;
         self.list_error = None;
 
         let client = self.client.clone();
         let limit = self.config.problem_list_page_size.clamp(1, 100);
+        let status_filter = if replace {
+            self.list_state.status
+        } else {
+            None
+        };
         self.bg.spawn(move || {
             let result = client
                 .fetch_problems(&ProblemQuery {
                     skip,
                     limit,
-                    ..ProblemQuery::default()
+                    status: status_filter,
+                    search: None,
                 })
                 .map_err(|e| e.to_string());
             ApiEvent::Problems { skip, result }
@@ -458,6 +608,7 @@ impl LeetrApp {
         self.detail_blocks.clear();
         self.detail_error = None;
         self.detail_loading = true;
+        self.tab = Tab::Statement;
         self.status = format!("Loading {slug}…");
 
         let client = self.client.clone();
@@ -527,10 +678,12 @@ impl LeetrApp {
                                 &detail,
                                 &self.config.default_language,
                             );
-                            self.prepare_workspace(&detail, &lang);
                             self.status = format!("{} · {}", detail.frontend_id, detail.title);
                             self.detail = Some(*detail);
                             self.detail_error = None;
+                            if let Some(detail) = self.detail.clone() {
+                                self.prepare_workspace(&detail, &lang);
+                            }
                         }
                         Err(err) => {
                             self.detail_error = Some(err.clone());
@@ -548,9 +701,6 @@ impl LeetrApp {
                         let mut view = JudgeView::from_result(&result, is_submission);
                         view.warning = override_warning;
                         self.status = view.summary.clone();
-                        if self.error.is_none() {
-                            self.error = None;
-                        }
                         // A successful first submission means the problem is
                         // now solved; keep the guard's data honest.
                         if is_submission && result.verdict() == Verdict::Accepted {
@@ -580,13 +730,6 @@ impl LeetrApp {
                         } else {
                             // Do not claim to be signed in when we are not: an
                             // expired cookie reported "Signed in as (unknown)".
-                            //
-                            // Deliberately NOT written to `status`: that is a
-                            // transient slot which routine messages ("50
-                            // problems loaded") legitimately overwrite, and a
-                            // standing condition does not belong there. The badge
-                            // and its tooltip carry it in the UI, and `auth` in
-                            // the control API carries it to tooling.
                             self.solved.clear();
                         }
                         // `Some(_)` with `signed_in == false` means "checked and
@@ -610,6 +753,50 @@ impl LeetrApp {
     }
 
     // -- workspace / editor --------------------------------------------------
+
+    /// Recreate the solution editor for `lang_slug`, seeded with `text`.
+    ///
+    /// The component editor takes its language once at construction, so a
+    /// switch builds a fresh state (the workspace file stays the source of
+    /// truth, and `set_value` emits no change event, so this never loops).
+    fn reset_editor(
+        &mut self,
+        lang_slug: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let language = editor_language(lang_slug);
+        let seed = text.to_string();
+        let state = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language(language)
+                .default_value(seed)
+        });
+        let sub = cx.subscribe(
+            &state,
+            |this: &mut Self, emitter, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = emitter.read(cx).value().to_string();
+                    if let Some(buffer) = this.code.as_mut() {
+                        buffer.set_text(text);
+                        if let Err(err) = buffer.save() {
+                            this.error = Some(format!("could not save the solution: {err}"));
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+        );
+        self.code_input = state;
+        if let Some(slot) = self._subscriptions.get_mut(1) {
+            *slot = sub;
+        } else {
+            self._subscriptions.push(sub);
+        }
+        self.editor_lang_slug = lang_slug.to_string();
+        self.pending_lang = None;
+    }
 
     /// Create the problem's files and load its buffer, applying any code that
     /// arrived over the control API while the problem was still loading.
@@ -640,6 +827,13 @@ impl LeetrApp {
                 } else {
                     format!("editing {}", prepared.solution.display())
                 };
+                // `set_value` needs a `Window`, which this tick does not
+                // have; the code pane pushes the text (and language) on its
+                // next paint.
+                if self.editor_lang_slug != buffer.lang_slug {
+                    self.pending_lang = Some(buffer.lang_slug.clone());
+                }
+                self.code_input_needs_sync = Some(buffer.text.clone());
                 self.code = Some(buffer);
             }
             Err(err) => {
@@ -675,6 +869,10 @@ impl LeetrApp {
                     &boilerplate,
                 );
                 self.status = format!("switched to {lang_slug}");
+                if self.editor_lang_slug != buffer.lang_slug {
+                    self.pending_lang = Some(buffer.lang_slug.clone());
+                }
+                self.code_input_needs_sync = Some(buffer.text.clone());
                 self.code = Some(buffer);
             }
             Err(err) => self.error = Some(format!("could not switch language: {err}")),
@@ -688,7 +886,7 @@ impl LeetrApp {
         };
         match buffer.reload_if_changed() {
             Ok(true) => {
-                self.reloaded_from_disk = true;
+                self.code_input_needs_sync = Some(buffer.text.clone());
                 self.status = "solution reloaded from disk".to_string();
             }
             Ok(false) => {}
@@ -866,6 +1064,7 @@ impl LeetrApp {
                             buffer.set_text(code);
                             match buffer.save() {
                                 Ok(()) => {
+                                    self.code_input_needs_sync = Some(buffer.text.clone());
                                     self.status = "solution synced from the editor".to_string();
                                     self.error = None;
                                 }
@@ -883,8 +1082,8 @@ impl LeetrApp {
 
     /// Publish what the control API can read.
     ///
-    /// Called once per frame: the payload is a LeetCode-sized solution, so the
-    /// clone is cheap and it removes a whole class of staleness bugs.
+    /// Called on every timer tick: the payload is a LeetCode-sized solution, so
+    /// the clone is cheap and it removes a whole class of staleness bugs.
     fn publish_snapshot(&self) {
         let snapshot = Snapshot {
             slug: self.selected.clone(),
@@ -919,184 +1118,223 @@ impl LeetrApp {
         self.interop_shared.publish(snapshot);
     }
 
-    fn code_pane(&mut self, ui: &mut egui::Ui) {
-        let languages = self.languages.clone();
-        let Some(buffer) = self.code.as_mut() else {
-            ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.label(egui::RichText::new("Open a problem to get a solution buffer.").weak());
-            });
-            return;
-        };
+    // -- palettes ------------------------------------------------------------
 
-        let dirty = buffer.is_dirty();
-        let reloaded = self.reloaded_from_disk;
-        let can_submit = self.config.allow_unsolved_submit
-            || self
-                .selected
-                .as_ref()
-                .is_some_and(|slug| self.solved.contains(slug));
-        let judge = self.judge.clone();
-        let action = code_editor::show(
-            ui,
-            buffer,
-            &languages,
-            dirty,
-            reloaded,
-            judge.as_ref(),
-            can_submit,
-        );
-        self.reloaded_from_disk = false;
+    /// Which command palette is open. [`Command`] owns the query, the filter
+    /// and the highlight; the view supplies ranked rows and applies choices.
+    fn open_actions_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette = Some(PaletteKind::Actions);
+        self.actions_cmd.update(cx, |state, cx| {
+            state.set_query("", window, cx);
+        });
+        let handle = self.actions_cmd.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
 
-        if action.run {
-            self.start_judge(false);
-        }
-        if action.submit {
-            self.start_judge(true);
-        }
+    fn open_problems_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette = Some(PaletteKind::Problems);
+        self.problems_cmd.update(cx, |state, cx| {
+            state.set_query("", window, cx);
+        });
+        let handle = self.problems_cmd.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
 
-        if let Some(language) = action.language {
-            self.switch_language(language);
-        }
-        if action.open_in_nvim {
-            self.open_in_nvim();
-        }
-        if action.changed {
-            if let Some(buffer) = self.code.as_mut() {
-                if let Err(err) = buffer.save() {
-                    self.error = Some(format!("could not save the solution: {err}"));
+    fn close_palette(&mut self) {
+        self.open_palette = None;
+    }
+
+    /// One confirmed command-palette row.
+    fn confirm_palette(
+        &mut self,
+        kind: PaletteKind,
+        path: IndexPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match kind {
+            PaletteKind::Actions => {
+                let groups = self.action_groups();
+                let action = groups
+                    .get(path.section)
+                    .and_then(|(_, rows)| rows.get(path.row))
+                    .map(|(action, _)| *action);
+                if let Some(action) = action {
+                    self.open_palette = None;
+                    match action {
+                        Action::SelectProblem => self.open_problems_palette(window, cx),
+                        other => self.run_action(other, cx),
+                    }
+                }
+            }
+            PaletteKind::Problems => {
+                let query = self.problems_cmd.read(cx).query(cx).to_string();
+                let groups = self.problem_rows(&query);
+                let slug = groups
+                    .get(path.section)
+                    .and_then(|(_, rows)| rows.get(path.row))
+                    .map(|row| row.slug.clone());
+                if let Some(slug) = slug {
+                    self.open_palette = None;
+                    self.open_problem(slug);
                 }
             }
         }
+        cx.notify();
     }
 
-    // -- command palettes ---------------------------------------------------
-
-    /// Every action reachable from `Ctrl+K`, in display order.
-    ///
-    /// Labels are the verb ("Toggle theme") and hints are the detail the user
-    /// might remember instead ("switch to Light mode"), because both are
-    /// searched by the fuzzy matcher.
-    fn action_catalog(&self) -> Vec<(Action, PaletteEntry)> {
-        let theme = self.config.theme;
-        let has_selection = self.selected.is_some();
-        let has_more = (self.problems.len() as u32) < self.total;
-        let slug = self.selected.clone().unwrap_or_default();
-
-        // (action, hint, icon, section, shortcut, enabled)
-        let catalog: [ActionRow; 10] = [
+    fn action_catalog(&self) -> Vec<ActionRow> {
+        let mut rows = vec![
+            (
+                Action::ToggleTheme,
+                format!("Switch to {} mode", self.config.theme.toggled().label()),
+                "Theme",
+                None,
+            ),
             (
                 Action::SelectProblem,
-                "Ctrl+P problem selector".to_string(),
-                glyphs::BULLET,
-                "Quick actions",
+                "Fuzzy jump to any loaded problem".to_string(),
+                "Go",
                 Some("Ctrl P"),
-                true,
             ),
             (
                 Action::ShowProblems,
-                "back to the full list".to_string(),
-                glyphs::BULLET,
-                "Quick actions",
+                "Back to the full problem list".to_string(),
+                "Go",
                 None,
-                has_selection,
             ),
             (
                 Action::RefreshProblems,
-                "refetch the first page".to_string(),
-                glyphs::REFRESH,
-                "Problem list",
+                "Fetch the first page again".to_string(),
+                "Problems",
                 None,
-                true,
             ),
             (
                 Action::LoadMore,
-                "fetch the next page".to_string(),
-                glyphs::BULLET,
-                "Problem list",
+                "Append the next page".to_string(),
+                "Problems",
                 None,
-                has_more,
             ),
             (
                 Action::ClearFilters,
-                "reset search, difficulty and status".to_string(),
-                glyphs::BULLET,
-                "Problem list",
+                "Reset search, status and difficulty".to_string(),
+                "Problems",
                 None,
-                self.list_state.is_filtered(),
             ),
             (
                 Action::TogglePremiumFilter,
-                if self.list_state.hide_premium {
-                    "currently hidden".to_string()
-                } else {
-                    "currently shown".to_string()
-                },
-                glyphs::PREMIUM,
-                "Problem list",
+                "Hide or show premium-only problems".to_string(),
+                "Problems",
                 None,
-                true,
-            ),
-            (
-                Action::OpenOnLeetCode,
-                slug.clone(),
-                glyphs::BULLET,
-                "Current problem",
-                None,
-                has_selection,
-            ),
-            (
-                Action::CopyProblemLink,
-                slug,
-                glyphs::BULLET,
-                "Current problem",
-                None,
-                has_selection,
-            ),
-            (
-                Action::ToggleTheme,
-                format!("switch to {} mode", theme.toggled().label()),
-                theme.toggled().icon(),
-                "Application",
-                None,
-                true,
-            ),
-            (
-                Action::Quit,
-                String::new(),
-                glyphs::BULLET,
-                "Application",
-                None,
-                true,
             ),
         ];
-
-        catalog
-            .into_iter()
-            .filter(|row| row.5)
-            .map(|(action, hint, icon, section, shortcut, _)| {
-                let mut entry = PaletteEntry::new(action.search_label())
-                    .with_hint(hint)
-                    .with_icon(icon)
-                    .with_section(section);
-                if let Some(shortcut) = shortcut {
-                    entry = entry.with_shortcut(shortcut);
-                }
-                (action, entry)
-            })
-            .collect()
+        if self.selected.is_some() {
+            rows.push((
+                Action::OpenOnLeetCode,
+                "Open the current problem in a browser".to_string(),
+                "Problem",
+                None,
+            ));
+            rows.push((
+                Action::CopyProblemLink,
+                "Copy the problem URL".to_string(),
+                "Problem",
+                None,
+            ));
+        }
+        rows.push((Action::Quit, "Close the window".to_string(), "App", None));
+        rows
     }
 
-    fn run_action(&mut self, action: Action, ctx: &egui::Context) {
-        match action {
-            Action::ToggleTheme => {
-                let next = self.config.theme.toggled();
-                self.set_theme(next, ctx);
+    /// Action rows grouped by section, in catalog order.
+    fn action_groups(&self) -> Vec<(String, Vec<(Action, String)>)> {
+        let mut groups: Vec<(String, Vec<(Action, String)>)> = Vec::new();
+        for (action, hint, section, _) in self.action_catalog() {
+            match groups.last_mut() {
+                Some((name, rows)) if name == section => rows.push((action, hint)),
+                _ => groups.push((section.to_string(), vec![(action, hint)])),
             }
-            Action::SelectProblem => self.problems_palette.open(),
+        }
+        groups
+    }
+
+    /// Problem rows matching `query`/`chip`, grouped by status for browsing
+    /// and flat when ranked. Mirrors the palette's grouped-browse contract.
+    fn problem_rows(&self, query: &str) -> Vec<(String, Vec<ProblemRow>)> {
+        let mut entries = Vec::new();
+        let mut slugs = Vec::new();
+        for problem in self.problems.iter().take(MAX_PALETTE_PROBLEMS) {
+            let section = match problem.status {
+                ProblemStatus::Solved => "Solved",
+                ProblemStatus::Attempted => "Attempted",
+                ProblemStatus::Todo => "Todo",
+            };
+            entries.push(
+                PaletteEntry::new(format!("{}. {}", problem.id, problem.title))
+                    .with_hint(format!(
+                        "{} · {}",
+                        problem.difficulty.label(),
+                        problem.status.label()
+                    ))
+                    .with_section(section)
+                    .with_tags([
+                        problem.difficulty.label().to_lowercase(),
+                        problem.status.label().to_lowercase(),
+                    ]),
+            );
+            slugs.push(problem.slug.clone());
+        }
+        let matches: Vec<usize> = palette::visible_matches(query, &entries, None)
+            .into_iter()
+            .take(MAX_ROWS)
+            .collect();
+        if query.trim().is_empty() {
+            // Cluster by section in first-appearance order; the match order
+            // within a section is preserved.
+            let mut groups: Vec<(String, Vec<ProblemRow>)> = Vec::new();
+            for index in matches {
+                let section = entries[index].section.clone().unwrap_or_default();
+                let row = ProblemRow {
+                    slug: slugs[index].clone(),
+                    label: entries[index].label.clone(),
+                };
+                match groups.last_mut() {
+                    Some((name, rows)) if *name == section => rows.push(row),
+                    _ => groups.push((section, vec![row])),
+                }
+            }
+            groups
+        } else {
+            vec![(
+                "Problems".to_string(),
+                matches
+                    .into_iter()
+                    .map(|index| ProblemRow {
+                        slug: slugs[index].clone(),
+                        label: entries[index].label.clone(),
+                    })
+                    .collect(),
+            )]
+        }
+    }
+
+    fn run_action(&mut self, action: Action, cx: &mut App) {
+        match action {
+            Action::ToggleTheme => self.toggle_theme(cx),
+            // The problem selector opens the other palette, which needs a
+            // window; the confirm handler does that directly and never lands
+            // here.
+            Action::SelectProblem => {
+                self.status = "use Ctrl+P for the problem selector".to_string();
+            }
             Action::ShowProblems => self.close_problem(),
             Action::RefreshProblems => self.load_first_page(),
-            Action::LoadMore => self.load_next_page(),
+            Action::LoadMore => {
+                self.row_cap = self.row_cap.saturating_add(ROW_PAGE);
+                self.load_next_page();
+            }
             Action::ClearFilters => self.list_state.clear_filters(),
             Action::TogglePremiumFilter => {
                 self.list_state.hide_premium = !self.list_state.hide_premium;
@@ -1106,497 +1344,1298 @@ impl LeetrApp {
                     let url = problem_url(&slug);
                     if let Err(err) = open_in_browser(&url) {
                         self.error = Some(err);
+                    } else {
+                        self.status = format!("opened {url}");
                     }
                 }
             }
             Action::CopyProblemLink => {
-                if let Some(slug) = self.selected.clone() {
-                    let url = problem_url(&slug);
-                    ctx.copy_text(url.clone());
-                    self.status = format!("Copied {url}");
+                if let Some(slug) = self.selected.as_deref() {
+                    self.status = format!("link: {}", problem_url(slug));
                 }
             }
             Action::Quit => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                // Handled via the Quit action binding; kept here for symmetry.
+                self.quit_requested = true;
             }
         }
     }
 
-    /// Draw `Ctrl+K` (actions) and `Ctrl+P` (problem selector).
-    fn show_palettes(&mut self, ctx: &egui::Context) {
-        // -- Ctrl+K: actions ------------------------------------------------
-        let catalog = self.action_catalog();
-        let entries: Vec<PaletteEntry> = catalog.iter().map(|(_, e)| e.clone()).collect();
+    fn toggle_theme(&mut self, cx: &mut App) {
+        let next = self.config.theme.toggled();
+        self.config.theme = next;
+        KitTheme::change(next.mode(), None, cx);
+        if let Err(err) = self.config.save() {
+            self.error = Some(format!("could not save the theme: {err}"));
+        } else {
+            self.status = format!("{} mode", next.label());
+        }
+    }
+}
 
-        let outcome = ui::palette::show(
-            ctx,
-            &mut self.actions_palette,
-            &entries,
-            &ui::palette::PaletteConfig {
-                id: "actions",
-                placeholder: "Type a command…",
-                search_badge: Some("Ctrl K"),
-                chips: Vec::new(),
-                empty_action: None,
-            },
+// -- rendering -----------------------------------------------------------
+
+const MUTED_DARK: u32 = 0x979EA9;
+const BORDER_DARK: u32 = 0x2D3239;
+
+impl LeetrView {
+    /// One navigable row in the sidebar.
+    ///
+    /// Kept as a small builder rather than inline closures so the same item
+    /// shape (label, icon, active state, trailing hint) is used everywhere.
+    fn sidebar_item(
+        view: &Entity<Self>,
+        label: String,
+        icon: Icon,
+        active: bool,
+        suffix: Option<String>,
+        on_click: impl Fn(&mut Self) + 'static + Clone,
+    ) -> SidebarMenuItem {
+        let view = view.clone();
+        let mut item = SidebarMenuItem::new(label)
+            .icon(icon)
+            .active(active)
+            .on_click(move |_, window, cx| {
+                view.update(cx, |this, _| on_click(this));
+                window.refresh();
+            });
+        if let Some(text) = suffix {
+            item = item.suffix(move |_, _| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED_DARK))
+                    .child(text.clone())
+            });
+        }
+        item
+    }
+
+    /// Status icon for a problem row, coloured by difficulty.
+    fn status_icon(status: ProblemStatus, difficulty: Difficulty) -> Icon {
+        let name = match status {
+            ProblemStatus::Solved => IconName::CircleCheck,
+            ProblemStatus::Attempted => IconName::CircleDot,
+            ProblemStatus::Todo => IconName::Circle,
+        };
+        Icon::new(name)
+            .size_4()
+            .text_color(rgb(theme::difficulty_hex(difficulty)))
+    }
+
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let matching = self.list_state.matching(&self.problems);
+        let shown = matching.len().min(self.row_cap);
+        let badge = self.auth_badge();
+        let (session_text, session_color) = session_line(&badge);
+        let theme_label = self.config.theme.label().to_string();
+        let theme_icon = self.config.theme.icon().to_string();
+        let view = cx.entity();
+
+        // ---- header: brand, session, quick actions, search ----
+        let toggle_view = view.clone();
+        let header = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_lg().font_weight(FontWeight::BOLD).child("leetr"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .child(
+                                SidebarToggleButton::new()
+                                    .collapsed(self.sidebar_collapsed)
+                                    .accessibility_label("Toggle sidebar")
+                                    .on_click(move |_, window, cx| {
+                                        toggle_view.update(cx, |this, _| {
+                                            this.sidebar_collapsed = !this.sidebar_collapsed;
+                                        });
+                                        window.refresh();
+                                    }),
+                            )
+                            .child(
+                                Button::new("theme-toggle")
+                                    .label(format!("{theme_icon} {theme_label}"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.toggle_theme(cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(match session_color {
+                        Some(hex) => rgb(hex),
+                        None => rgb(MUTED_DARK),
+                    })
+                    .child(session_text),
+            )
+            .child(
+                Button::new("quick-actions")
+                    .label("Quick actions  ⌘K")
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_actions_palette(window, cx);
+                    })),
+            )
+            .child(Input::new(&self.search_input).id("problem-search"));
+
+        // ---- "Filter" group: status, level, premium ----
+        let status = self.list_state.status;
+        let difficulty = self.list_state.difficulty;
+        let mut filters = vec![
+            Self::sidebar_item(
+                &view,
+                "All problems".to_string(),
+                Icon::new(IconName::ListTodo).size_4(),
+                status.is_none(),
+                Some(format!("{}", self.total)),
+                |this| {
+                    this.list_state.status = None;
+                    this.row_cap = ROW_PAGE;
+                },
+            ),
+            Self::sidebar_item(
+                &view,
+                "Solved".to_string(),
+                Icon::new(IconName::CircleCheck)
+                    .size_4()
+                    .text_color(rgb(theme::SUCCESS_HEX)),
+                status == Some(ProblemStatus::Solved),
+                None,
+                |this| {
+                    this.list_state.status = Some(ProblemStatus::Solved);
+                    this.row_cap = ROW_PAGE;
+                },
+            ),
+            Self::sidebar_item(
+                &view,
+                "Attempted".to_string(),
+                Icon::new(IconName::CircleDot)
+                    .size_4()
+                    .text_color(rgb(theme::WARNING_HEX)),
+                status == Some(ProblemStatus::Attempted),
+                None,
+                |this| {
+                    this.list_state.status = Some(ProblemStatus::Attempted);
+                    this.row_cap = ROW_PAGE;
+                },
+            ),
+            Self::sidebar_item(
+                &view,
+                "Todo".to_string(),
+                Icon::new(IconName::Circle)
+                    .size_4()
+                    .text_color(rgb(MUTED_DARK)),
+                status == Some(ProblemStatus::Todo),
+                None,
+                |this| {
+                    this.list_state.status = Some(ProblemStatus::Todo);
+                    this.row_cap = ROW_PAGE;
+                },
+            ),
+        ];
+
+        // Level is a submenu: the parent shows the active level, the children
+        // pick one — the component's own collapsible-item pattern.
+        let level_label = match difficulty {
+            None => "All levels".to_string(),
+            Some(level) => level.label().to_string(),
+        };
+        filters.push(
+            SidebarMenuItem::new("Level")
+                .click_to_toggle(true)
+                .icon(Icon::new(IconName::Gauge).size_4())
+                .suffix(move |_, _| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED_DARK))
+                        .child(level_label.clone())
+                })
+                .children(
+                    [
+                        None,
+                        Some(Difficulty::Easy),
+                        Some(Difficulty::Medium),
+                        Some(Difficulty::Hard),
+                    ]
+                    .into_iter()
+                    .map(|level| {
+                        let label = match level {
+                            None => "All levels".to_string(),
+                            Some(level) => level.label().to_string(),
+                        };
+                        let hex = level.map_or(MUTED_DARK, theme::difficulty_hex);
+                        Self::sidebar_item(
+                            &view,
+                            label,
+                            Icon::new(IconName::Circle).size_3().text_color(rgb(hex)),
+                            difficulty == level,
+                            None,
+                            move |this| {
+                                this.list_state.difficulty = level;
+                                this.row_cap = ROW_PAGE;
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                ),
         );
-        if let Some(index) = resolve_palette_choice(&mut self.actions_palette, &outcome) {
-            if let Some((action, _)) = catalog.get(index) {
-                self.run_action(*action, ctx);
-            }
+
+        let premium = self.list_state.hide_premium;
+        filters.push(Self::sidebar_item(
+            &view,
+            "Premium only".to_string(),
+            Icon::new(IconName::Star)
+                .size_4()
+                .text_color(rgb(theme::ACCENT_HEX)),
+            premium,
+            None,
+            move |this| {
+                this.list_state.hide_premium = !this.list_state.hide_premium;
+                this.row_cap = ROW_PAGE;
+            },
+        ));
+
+        // ---- "Problems" group ----
+        let mut problem_items = Vec::new();
+        for &index in matching.iter().take(shown) {
+            let problem = &self.problems[index];
+            let slug = problem.slug.clone();
+            let active = self.selected.as_deref() == Some(slug.as_str());
+            let label = format!("{}. {}", problem.id, problem.title);
+            let diff_label = problem.difficulty.label().to_string();
+            let diff_hex = theme::difficulty_hex(problem.difficulty);
+            let icon = Self::status_icon(problem.status, problem.difficulty);
+            let item_view = view.clone();
+            problem_items.push(
+                SidebarMenuItem::new(label)
+                    .icon(icon)
+                    .active(active)
+                    .suffix(move |_, _| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(diff_hex))
+                            .child(diff_label.clone())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let slug = slug.clone();
+                        item_view.update(cx, |this, _| this.open_problem(slug));
+                        window.refresh();
+                    }),
+            );
+        }
+        let remaining = matching.len().saturating_sub(shown);
+        if remaining > 0 {
+            problem_items.push(Self::sidebar_item(
+                &view,
+                format!("Show {remaining} more"),
+                Icon::new(IconName::ChevronsDown)
+                    .size_4()
+                    .text_color(rgb(MUTED_DARK)),
+                false,
+                None,
+                |this| {
+                    this.row_cap = this.row_cap.saturating_add(ROW_PAGE);
+                    this.load_next_page();
+                },
+            ));
         }
 
-        // -- Ctrl+P: problem selector ---------------------------------------
-        if self.problems_palette.is_open() {
-            let query = self.problems_palette.query().to_string();
-            let cap = self.problems.len().min(MAX_PALETTE_PROBLEMS);
-            let entries: Vec<PaletteEntry> = self.problems[..cap]
-                .iter()
-                .map(|problem| {
-                    PaletteEntry::new(format!("{}. {}", problem.id, problem.title))
-                        .with_hint(format!(
-                            "{} · {}",
-                            problem.difficulty.label(),
-                            problem.status.label()
-                        ))
-                        .with_icon(problem.status.marker().to_string())
-                        .with_section(problem.status.label())
-                        .with_tags([
-                            problem.difficulty.label().to_ascii_lowercase(),
-                            problem.status.label().to_string(),
-                        ])
-                })
-                .collect();
-
-            let search_label = if query.trim().len() >= 2 {
-                Some(format!("Search LeetCode for “{}”", query.trim()))
-            } else {
-                None
-            };
-
-            let outcome = ui::palette::show(
-                ctx,
-                &mut self.problems_palette,
-                &entries,
-                &ui::palette::PaletteConfig {
-                    id: "problems",
-                    placeholder: "Jump to a problem…",
-                    search_badge: Some("Ctrl P"),
-                    chips: vec![
-                        ui::palette::PaletteChip::new("all", "All"),
-                        ui::palette::PaletteChip::new("easy", "Easy"),
-                        ui::palette::PaletteChip::new("medium", "Medium"),
-                        ui::palette::PaletteChip::new("hard", "Hard"),
-                        ui::palette::PaletteChip::new("solved", "Solved"),
-                        ui::palette::PaletteChip::new("attempted", "Attempted"),
-                        ui::palette::PaletteChip::new("todo", "Todo"),
-                    ],
-                    empty_action: search_label.as_deref(),
+        // ---- "Current problem" group ----
+        let mut current_items = Vec::new();
+        if let Some(slug) = self.selected.clone() {
+            let running = self.judge.as_ref().is_some_and(|judge| judge.running);
+            let has_code = self.code.is_some();
+            if has_code {
+                current_items.push(Self::sidebar_item(
+                    &view,
+                    "Run sample tests".to_string(),
+                    Icon::new(IconName::Zap).size_4(),
+                    false,
+                    Some("Ctrl '".to_string()),
+                    move |this| this.start_judge(false),
+                ));
+                current_items.push(Self::sidebar_item(
+                    &view,
+                    "Submit solution".to_string(),
+                    Icon::new(if running {
+                        IconName::LoaderCircle
+                    } else {
+                        IconName::CircleCheckBig
+                    })
+                    .size_4(),
+                    false,
+                    Some("Ctrl ↵".to_string()),
+                    move |this| this.start_judge(true),
+                ));
+                current_items.push(Self::sidebar_item(
+                    &view,
+                    "Open in nvim".to_string(),
+                    Icon::new(IconName::SquareCode).size_4(),
+                    false,
+                    Some("Ctrl O".to_string()),
+                    move |this| this.open_in_nvim(),
+                ));
+            }
+            current_items.push(Self::sidebar_item(
+                &view,
+                "Open on leetcode.com".to_string(),
+                Icon::new(IconName::ExternalLink).size_4(),
+                false,
+                None,
+                move |this| {
+                    let url = problem_url(&slug);
+                    match open_in_browser(&url) {
+                        Ok(()) => this.status = format!("opened {url}"),
+                        Err(err) => this.error = Some(err),
+                    }
                 },
+            ));
+        }
+
+        // ---- footer: counts ----
+        let footer = if self.list_loading {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(Spinner::new())
+                .child(div().text_xs().child("Loading…"))
+        } else {
+            let line = if self.list_state.is_filtered() {
+                format!("{shown} matching · {} loaded", self.problems.len())
+            } else {
+                format!("{shown} shown · {} total", self.total)
+            };
+            div().text_xs().text_color(rgb(MUTED_DARK)).child(line)
+        };
+
+        // ---- "App" group ----
+        let app_view = view.clone();
+        let app_items = vec![
+            Self::sidebar_item(
+                &app_view,
+                "Reload problem list".to_string(),
+                Icon::new(IconName::RefreshCw).size_4(),
+                false,
+                None,
+                move |this| this.load_first_page(),
+            ),
+            Self::sidebar_item(
+                &app_view,
+                "Clear filters".to_string(),
+                Icon::new(IconName::ListFilter).size_4(),
+                false,
+                None,
+                move |this| {
+                    this.list_state.clear_filters();
+                    this.row_cap = ROW_PAGE;
+                },
+            ),
+        ];
+
+        let mut sidebar = Sidebar::new("leetr-sidebar")
+            .collapsible(SidebarCollapsible::Icon)
+            .collapsed(self.sidebar_collapsed)
+            .header(header)
+            .child(SidebarGroup::new("Filter").children(filters));
+        if !problem_items.is_empty() {
+            sidebar = sidebar.child(SidebarGroup::new("Problems").children(problem_items));
+        }
+        if !current_items.is_empty() {
+            sidebar = sidebar.child(SidebarGroup::new("Current problem").children(current_items));
+        }
+        sidebar = sidebar.child(SidebarGroup::new("App").children(app_items));
+        sidebar.footer(footer).into_any_element()
+    }
+
+    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(detail) = self.detail.clone() else {
+            let message = if self.detail_loading {
+                "Loading statement…"
+            } else if let Some(err) = self.detail_error.as_deref() {
+                let _ = err;
+                "Could not load the statement."
+            } else {
+                statement::empty_message(false)
+            };
+            return div()
+                .flex()
+                .flex_1()
+                .h_full()
+                .items_center()
+                .justify_center()
+                .child(div().text_sm().text_color(rgb(MUTED_DARK)).child(message))
+                .into_any_element();
+        };
+
+        // The underline variant: children inherit it from the bar, and the
+        // active pane is marked by the sliding underline rather than a filled
+        // pill, which keeps the statement/code switch visually quiet.
+        let tabs = TabBar::new("leetr-tabs")
+            .underline()
+            .selected_index(match self.tab {
+                Tab::Statement => 0,
+                Tab::Code => 1,
+            })
+            .child(
+                KitTab::new()
+                    .label("Statement")
+                    .selected(self.tab == Tab::Statement)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.tab = Tab::Statement;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                KitTab::new()
+                    .label("Code")
+                    .selected(self.tab == Tab::Code)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.tab = Tab::Code;
+                        cx.notify();
+                    })),
             );
 
-            if outcome.empty_action {
-                self.search_problems(query.trim().to_string());
-                self.problems_palette.close();
+        let tab = self.tab;
+        let pane = match tab {
+            Tab::Statement => self.render_statement(&detail),
+            Tab::Code => self.render_code(cx),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .p_3()
+            .gap_2()
+            .child(tabs)
+            .child(pane)
+            .into_any_element()
+    }
+
+    fn render_statement(&self, detail: &QuestionDetail) -> AnyElement {
+        let header = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED_DARK))
+                            .child(detail.frontend_id.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .child(detail.title.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(theme::difficulty_hex(detail.difficulty)))
+                            .child(detail.difficulty.label().to_string()),
+                    )
+                    .children(detail.tags.iter().map(|tag| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED_DARK))
+                            .child(tag.name.clone())
+                    })),
+            );
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .id("statement-scroll")
+            .overflow_y_scroll()
+            .flex_1()
+            .gap_2()
+            .child(header);
+        if self.detail_loading {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(Spinner::new())
+                    .child(div().text_sm().child("Loading statement…")),
+            );
+        } else if detail.content_html.trim().is_empty() {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::WARNING_HEX))
+                    .child(statement::missing_body_message(detail).to_string()),
+            );
+        } else {
+            for (index, block) in self.detail_blocks.iter().enumerate() {
+                body = body.child(render_block(block, index));
             }
-            if let Some(index) = resolve_palette_choice(&mut self.problems_palette, &outcome) {
-                if let Some(problem) = self.problems.get(index) {
-                    let slug = problem.slug.clone();
-                    self.open_problem(slug);
+            if !detail.hints.is_empty() {
+                body = body.child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .child(format!("Hints ({})", detail.hints.len())),
+                );
+                for (index, hint) in detail.hints.iter().enumerate() {
+                    let text = html::to_plain_text(&html::parse(hint));
+                    body = body.child(div().text_sm().child(format!("{}. {text}", index + 1)));
                 }
             }
         }
+        body.into_any_element()
     }
 
-    /// True while any palette is open, so global shortcuts stand down.
-    fn palette_open(&self) -> bool {
-        self.actions_palette.is_open() || self.problems_palette.is_open()
-    }
-
-    // -- theme --------------------------------------------------------------
-
-    /// Switch colour scheme, persist the choice and report it in the status bar.
-    pub fn set_theme(&mut self, theme: Theme, ctx: &egui::Context) {
-        self.config.theme = theme;
-        theme.apply(ctx);
-        match self.config.save() {
-            Ok(()) => {
-                self.error = None;
-                self.status = format!("{} mode enabled", theme.label());
-            }
-            Err(err) => self.error = Some(format!("could not save config: {err}")),
-        }
-    }
-
-    // -- panels -------------------------------------------------------------
-
-    fn handle_list_action(&mut self, action: ProblemListAction, ctx: &egui::Context) {
-        if action.refresh {
-            self.load_first_page();
-        }
-        if let Some(query) = action.server_search {
-            self.search_problems(query);
-        }
-        if action.load_more {
-            self.load_next_page();
-        }
-        if let Some(slug) = action.open {
-            self.open_problem(slug);
-        }
-        if action.show_all {
-            self.close_problem();
-        }
-        if action.open_actions {
-            self.actions_palette.open();
-        }
-        if action.toggle_theme {
-            let next = self.config.theme.toggled();
-            self.set_theme(next, ctx);
-        }
-    }
-}
-
-impl eframe::App for LeetrApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
-        self.apply_interop_commands();
-        self.poll_workspace_file();
-
-        if self.list_loading || self.detail_loading {
-            ui.ctx().request_repaint_after(Duration::from_millis(80));
-        }
-
-        // With a solution open, keep ticking so an edit saved outside the app
-        // (nvim `:w`) is noticed. Without this, egui would idle and the mtime
-        // check in `poll_workspace_file` would never run.
-        if self.code.is_some() {
-            ui.ctx().request_repaint_after(Duration::from_millis(400));
-        }
-
-        // Global shortcuts.
-        //
-        // `consume_key` matches against the *event's own* modifiers rather than
-        // `InputState::modifiers` (the live key state). That matters: with a
-        // fast synthetic or human key sequence the modifier can already be
-        // released by the time the frame runs, in which case checking
-        // `i.modifiers` silently misses the shortcut. Consuming the event also
-        // stops a focused `TextEdit` from acting on it (egui binds Ctrl+K to
-        // "delete to end of line").
-        //
-        // `Modifiers::COMMAND` is Ctrl on Linux/Windows and Cmd on macOS.
-        // Shortcuts stand down while a palette is open so it keeps focus.
-        if !self.palette_open() {
-            let open_actions = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K));
-            let open_problems = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P));
-            let open_nvim = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
-            let run_tests = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Quote));
-            let submit_solution = ui.ctx().input_mut(|i| {
-                i.consume_key(
-                    egui::Modifiers {
-                        command: true,
-                        ..Default::default()
-                    },
-                    egui::Key::Enter,
+    fn render_code(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(buffer) = self.code.clone() else {
+            return div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED_DARK))
+                        .child("Open a problem to get a solution buffer."),
                 )
-            });
-            // Tab switches panes, but only when no widget has keyboard focus.
-            // Tab is the standard "move focus" key, so claiming it while the
-            // user is typing in the filter box teleports them to the code pane
-            // mid-query. This runs before widgets are drawn, so the check has
-            // to happen here rather than relying on the text field to refuse it.
-            let nothing_focused = ui.ctx().memory(|memory| memory.focused().is_none());
-            // Only consume the key when it is actually ours — otherwise the
-            // focused widget must still receive it.
-            let tab_to_code = if tab_switches_panes(self.tab, nothing_focused) {
-                ui.ctx()
-                    .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
-            } else {
-                false
-            };
-            let toggle_sidebar = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B));
-
-            if open_actions {
-                self.actions_palette.open();
-            }
-            if open_problems {
-                self.problems_palette.open();
-            }
-            if open_nvim {
-                self.open_in_nvim();
-            }
-            if run_tests && self.code.is_some() {
-                self.start_judge(false);
-            }
-            if submit_solution && self.code.is_some() {
-                self.start_judge(true);
-            }
-            if tab_to_code {
-                self.tab = Tab::Code;
-            }
-            if toggle_sidebar && self.selected.is_some() {
-                self.sidebar_collapsed = !self.sidebar_collapsed;
-                self.status = if self.sidebar_collapsed {
-                    "Sidebar hidden".to_string()
-                } else {
-                    "Sidebar shown".to_string()
-                };
-            }
-        }
-
-        egui::Panel::bottom("leetr-status").show(ui, |ui| {
-            let badge = self.auth_badge();
-            let api_port = self
-                .interop
-                .as_ref()
-                .map(|server| server.port())
-                .unwrap_or(self.config.interop_port);
-            ui::status_bar::show(
-                ui,
-                &self.config,
-                &badge,
-                &self.status,
-                self.error.as_deref(),
-                api_port,
-            );
-        });
-
-        // The problem list is the app's sidebar. Its chrome (brand, session
-        // line, quick actions) is drawn by the panel itself.
-        let badge = self.auth_badge();
-        let (session, session_color) = session_line(&badge);
-        let header = ui::problem_list::Header {
-            session: &session,
-            session_color,
-            theme: self.config.theme,
+                .into_any_element();
         };
 
-        let mut action = ProblemListAction::default();
-        let has_more = (self.problems.len() as u32) < self.total;
+        let lang_row = div()
+            .flex()
+            .flex_row()
+            .gap_1()
+            .children(self.languages.iter().map(|choice| {
+                let slug = choice.slug.clone();
+                let active = buffer.lang_slug == slug;
+                Button::new(SharedString::from(format!("lang-{slug}")))
+                    .label(choice.label.clone())
+                    .toggled(active)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.switch_language(slug.clone());
+                        cx.notify();
+                    }))
+            }));
 
-        if self.selected.is_none() {
-            // Nothing is open, so the list spans the whole window.
-            egui::CentralPanel::default_margins().show(ui, |ui| {
-                action = ui::problem_list::show(
-                    ui,
-                    &mut self.list_state,
-                    &header,
-                    &self.problems,
-                    self.total,
-                    self.list_loading,
-                    self.list_error.as_deref(),
-                    has_more,
-                    None,
-                );
-            });
-        } else {
-            // A problem is open: the list shrinks to a sidebar on the left and
-            // the statement/code fills the wider column beside it.
-            //
-            // `show_collapsible` slides the panel off-screen and clips its
-            // contents while doing so, and keeps a thin grab handle so the user
-            // can drag it back open. Ctrl+B flips the same flag.
-            //
-            // Note the polarity: the panel wants `is_expanded`, our field is
-            // `sidebar_collapsed`. Passing the field directly renders the
-            // sidebar collapsed (invisible) from the start.
-            let mut expanded = !self.sidebar_collapsed;
-            egui::Panel::left("leetr-problems")
-                .resizable(true)
-                .default_size(340.0)
-                .size_range(egui::Rangef::new(240.0, 560.0))
-                .show_collapsible(ui, &mut expanded, |ui| {
-                    action = ui::problem_list::show(
-                        ui,
-                        &mut self.list_state,
-                        &header,
-                        &self.problems,
-                        self.total,
-                        self.list_loading,
-                        self.list_error.as_deref(),
-                        has_more,
-                        self.selected.as_deref(),
-                    );
-                });
+        let judge = match self.judge.clone() {
+            None => div()
+                .text_xs()
+                .text_color(rgb(MUTED_DARK))
+                .child("Run the sample tests, or submit when you are confident.")
+                .into_any_element(),
+            Some(view) => render_judge(&view),
+        };
 
-            // The panel flips `expanded` itself when the user drags the resize
-            // handle closed or double-clicks the edge; mirror that back.
-            if expanded == self.sidebar_collapsed {
-                self.sidebar_collapsed = !expanded;
-                self.status = if self.sidebar_collapsed {
-                    "Sidebar hidden".to_string()
-                } else {
-                    "Sidebar shown".to_string()
-                };
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .gap_2()
+            .child(lang_row)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .flex_col()
+                    .id("solution-editor")
+                    .overflow_hidden()
+                    .child(Editor::new(&self.code_input).size_full()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(
+                        Button::new("run-tests")
+                            .label("Run tests")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.start_judge(false);
+                                cx.notify();
+                            })),
+                    )
+                    .child(Button::new("submit").label("Submit").on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| {
+                            this.start_judge(true);
+                            cx.notify();
+                        },
+                    )))
+                    .child(
+                        Button::new("open-nvim")
+                            .label("Open in nvim")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.open_in_nvim();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(judge)
+            .into_any_element()
+    }
+
+    fn render_status_bar(&self) -> AnyElement {
+        let badge = self.auth_badge();
+        let badge_text = match &badge {
+            AuthBadge::SignedIn { username, solved } if username.is_empty() => {
+                format!("{} signed in · {solved} solved", crate::glyphs::DOT)
             }
+            AuthBadge::SignedIn { username, solved } => {
+                format!("{} {username} · {solved} solved", crate::glyphs::DOT)
+            }
+            AuthBadge::Rejected => format!("{} session rejected", crate::glyphs::DOT),
+            AuthBadge::Checking => "checking session…".to_string(),
+            AuthBadge::BrowseOnly => format!("{} browse-only", crate::glyphs::DOT),
+        };
+        let badge_color = match &badge {
+            AuthBadge::SignedIn { .. } => theme::SUCCESS_HEX,
+            AuthBadge::Rejected => theme::DANGER_HEX,
+            AuthBadge::Checking => MUTED_DARK,
+            AuthBadge::BrowseOnly => theme::WARNING_HEX,
+        };
+        let message = match self.error.as_deref() {
+            Some(err) => err.to_string(),
+            None => self.status.clone(),
+        };
+        let message_color = match self.error {
+            Some(_) => theme::DANGER_HEX,
+            None => MUTED_DARK,
+        };
+        let port = self.interop.as_ref().map(|s| s.port()).unwrap_or(0);
 
-            egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
-                Tab::Statement => ui::statement::show(
-                    ui,
-                    self.detail.as_ref(),
-                    &self.detail_blocks,
-                    self.detail_loading,
-                    self.detail_error.as_deref(),
-                ),
-                Tab::Code => self.code_pane(ui),
-            });
-        }
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .py_1()
+            .border_t_1()
+            .border_color(rgb(BORDER_DARK))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(badge_color))
+                            .child(badge_text),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(message_color))
+                            .child(message),
+                    ),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED_DARK)).child(format!(
+                "{} · lang {} · api :{port}",
+                self.config.theme.label(),
+                self.config.default_language,
+            )))
+            .into_any_element()
+    }
 
-        let ctx = ui.ctx().clone();
-        self.handle_list_action(action, &ctx);
-        self.show_palettes(&ctx);
-        self.publish_snapshot();
+    fn render_palette(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(kind) = self.open_palette else {
+            return div().into_any_element();
+        };
+        // Reading the query establishes the host's dependency on the command
+        // state, so typing re-renders the overlay with freshly ranked rows.
+        let view = cx.entity();
+        let overlay = match kind {
+            PaletteKind::Actions => {
+                let cancel_view = view.clone();
+                let confirm_view = view.clone();
+                let mut command = Command::new(&self.actions_cmd)
+                    .filterable(false)
+                    .placeholder("Type a command…")
+                    .footer(|_, _, _| palette_footer("↑↓ navigate · Enter run · Esc close"))
+                    .on_cancel(move |window, cx| {
+                        cancel_view.update(cx, |this, _| {
+                            this.close_palette();
+                        });
+                        window.refresh();
+                    });
+                command = command.on_confirm(move |path, window, cx| {
+                    confirm_view.update(cx, |this, ctx| {
+                        this.confirm_palette(PaletteKind::Actions, path, window, ctx);
+                    });
+                    window.refresh();
+                });
+                for (section, rows) in self.action_groups() {
+                    let mut group = CommandGroup::new().label(section);
+                    for (action, _) in rows {
+                        group = group.item(CommandItem::new().label(action.search_label()));
+                    }
+                    command = command.group(group);
+                }
+                command.into_any_element()
+            }
+            PaletteKind::Problems => {
+                let query = self.problems_cmd.read(cx).query(cx).to_string();
+                let groups = self.problem_rows(&query);
+                let supplied: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
+                let cancel_view = view.clone();
+                let confirm_view = view.clone();
+                let mut command = Command::new(&self.problems_cmd)
+                    .filterable(false)
+                    .placeholder("Jump to a problem…")
+                    .footer(|_, _, _| palette_footer("↑↓ navigate · Enter open · Esc close"))
+                    .on_cancel(move |window, cx| {
+                        cancel_view.update(cx, |this, _| {
+                            this.close_palette();
+                        });
+                        window.refresh();
+                    });
+                command = command.on_confirm(move |path, window, cx| {
+                    confirm_view.update(cx, |this, ctx| {
+                        this.confirm_palette(PaletteKind::Problems, path, window, ctx);
+                    });
+                    window.refresh();
+                });
+                for (section, rows) in &groups {
+                    let mut group = CommandGroup::new().label(section.clone());
+                    for row in rows {
+                        group = group.item(CommandItem::new().label(row.label.clone()));
+                    }
+                    command = command.group(group);
+                }
+
+                // Status and difficulty are filtered from the sidebar; the
+                // palette is only a jump-to, so it carries no filter chips.
+                let mut panel = div().flex().flex_col().gap_1().child(command);
+                if supplied == 0 && !query.trim().is_empty() {
+                    let server_query = query.clone();
+                    panel = panel.child(
+                        Button::new("palette-server-search")
+                            .label(format!("Search LeetCode for “{query}”"))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.close_palette();
+                                this.search_problems(server_query.clone());
+                                cx.notify();
+                            })),
+                    );
+                }
+                panel.into_any_element()
+            }
+        };
+
+        div()
+            .absolute()
+            .top(px(76.))
+            .left(px(0.))
+            .right(px(0.))
+            .flex()
+            .justify_center()
+            .child(div().flex().flex_col().w(px(660.)).child(overlay))
+            .into_any_element()
     }
 }
 
-/// Launch the GUI. Blocks until the window is closed.
-pub fn run() -> anyhow::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Leetr")
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([840.0, 520.0]),
-        ..Default::default()
-    };
+fn render_block(block: &Block, index: usize) -> AnyElement {
+    match block {
+        Block::Paragraph(spans) => render_spans(spans, false),
+        Block::Heading(spans) => div()
+            .text_lg()
+            .font_weight(FontWeight::BOLD)
+            .child(render_spans(spans, false))
+            .into_any_element(),
+        Block::ListItem(spans) => div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(div().text_sm().child("•"))
+            .child(render_spans(spans, false))
+            .into_any_element(),
+        Block::Code(code) => div()
+            .w_full()
+            .rounded_md()
+            .bg(rgb(0x121417))
+            .p_2()
+            .child(div().text_xs().child(code.trim_end().to_string()))
+            .into_any_element(),
+        Block::Image { alt, url } => render_image(alt, url, index),
+        Block::Rule => div()
+            .h_px()
+            .w_full()
+            .bg(rgb(BORDER_DARK))
+            .into_any_element(),
+    }
+    .into_any_element()
+}
 
-    eframe::run_native(
-        "Leetr",
-        options,
-        Box::new(|cc| Ok(Box::new(LeetrApp::new(cc)))),
-    )
-    .map_err(|err| anyhow::anyhow!("failed to start the window: {err}"))
+/// A statement diagram.
+///
+/// Fetched through the app's [`gpui_kit::http_client::HttpClient`] (see
+/// [`crate::img`]) and cached by GPUI. The `.id(..)` is required for the loading
+/// state to appear at all.
+///
+/// A failure shows the URL rather than nothing, so a diagram the prose refers to
+/// is never silently missing — the guarantee the old placeholder text provided.
+/// The dimming layer behind an open palette.
+///
+/// Heavier than the library's dialog scrim (`theme().overlay`, 5% light / 20%
+/// dark): a dialog covers most of the window, while a palette is a panel in the
+/// middle of it, so the dimming has to read as one at a glance. Kept in the
+/// theme's terms (black, theme-dependent strength) so light mode is not turned
+/// into a dark room.
+fn palette_scrim(dark: bool) -> gpui_kit::Hsla {
+    gpui_kit::hsla(0., 0., 0., if dark { 0.5 } else { 0.35 })
+}
+
+/// The key-hint strip at the bottom of a palette.
+///
+/// Padded beyond the library default so the hints do not sit flush against the
+/// list above them or the panel edge below.
+fn palette_footer(hints: &'static str) -> AnyElement {
+    div()
+        .w_full()
+        .px_3()
+        .py_3()
+        .text_xs()
+        .text_color(rgb(MUTED_DARK))
+        .child(hints)
+        .into_any_element()
+}
+
+fn render_image(alt: &str, url: &str, index: usize) -> AnyElement {
+    let caption = alt.trim().to_string();
+    let fallback_url = url.to_string();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            img(SharedString::from(url.to_string()))
+                .id(SharedString::from(format!("statement-image-{index}")))
+                .w_full()
+                .max_h(px(420.))
+                .object_fit(ObjectFit::Contain)
+                .with_loading(|| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED_DARK))
+                        .child("Loading image…")
+                        .into_any_element()
+                })
+                .with_fallback(move || {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::WARNING_HEX))
+                                .child("Could not load this image"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED_DARK))
+                                .child(fallback_url.clone()),
+                        )
+                        .into_any_element()
+                }),
+        )
+        .when(!caption.is_empty(), |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED_DARK))
+                    .child(caption.clone()),
+            )
+        })
+        .into_any_element()
+}
+
+fn render_spans(spans: &[crate::leetcode::html::Span], _heading: bool) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .children(
+            spans
+                .iter()
+                .map(|span| {
+                    let mut text = div().text_sm().child(span.text.clone());
+                    match span.style {
+                        SpanStyle::Bold | SpanStyle::BoldItalic => {
+                            text = text.font_weight(FontWeight::BOLD);
+                        }
+                        SpanStyle::Code => {
+                            text = text.text_color(rgb(theme::ACCENT_HEX)).text_xs();
+                        }
+                        SpanStyle::Normal | SpanStyle::Italic => {}
+                    }
+                    text
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_any_element()
+}
+
+fn render_judge(view: &JudgeView) -> AnyElement {
+    let color = crate::ui::code_editor::verdict_hex(view.verdict);
+    let mut panel = div().flex().flex_col().gap_1();
+    if view.running {
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(Spinner::new())
+                .child(div().text_sm().child(view.summary.clone())),
+        );
+        return panel.into_any_element();
+    }
+    panel = panel.child(
+        div()
+            .text_sm()
+            .font_weight(FontWeight::BOLD)
+            .text_color(rgb(color))
+            .child(view.summary.clone()),
+    );
+    if let Some(warning) = view.warning.as_deref() {
+        panel = panel.child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::WARNING_HEX))
+                .child(warning.to_string()),
+        );
+    }
+    if let Some(error) = view.error.as_deref() {
+        panel = panel.child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::DANGER_HEX))
+                .child(error.to_string()),
+        );
+    }
+    for (key, value) in &view.detail {
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED_DARK))
+                        .child(key.clone()),
+                )
+                .child(div().text_xs().child(value.clone())),
+        );
+    }
+    panel.into_any_element()
+}
+
+impl Render for LeetrView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Deferred work that needs a window: quitting, and pushing workspace
+        // text (and language) into the solution editor.
+        if self.quit_requested {
+            cx.quit();
+        }
+        if let Some(lang) = self.pending_lang.clone() {
+            let text = self
+                .code
+                .as_ref()
+                .map(|buffer| buffer.text.clone())
+                .or(self.code_input_needs_sync.clone())
+                .unwrap_or_default();
+            self.code_input_needs_sync = None;
+            self.reset_editor(&lang, &text, window, cx);
+        } else if let Some(text) = self.code_input_needs_sync.take() {
+            self.code_input.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+            });
+        }
+
+        // A global shortcut asked for a palette; focusing its field needs the
+        // window, so it is applied here.
+        if let Some(kind) = self.pending_palette.take() {
+            match kind {
+                PaletteKind::Actions => self.open_actions_palette(window, cx),
+                PaletteKind::Problems => self.open_problems_palette(window, cx),
+            }
+        }
+
+        let overlay_open = self.open_palette.is_some();
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .when(!self.sidebar_collapsed, |row| {
+                        row.child(self.render_sidebar(cx))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .h_full()
+                            .flex_col()
+                            .child(self.render_main(cx)),
+                    ),
+            )
+            .child(self.render_status_bar())
+            .when(overlay_open, |root| {
+                // Dim the window behind the palette and swallow the click that
+                // dismisses it. Both layers sit after the app's own children,
+                // so they paint over everything.
+                root.child(
+                    div()
+                        .id("palette-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(palette_scrim(cx.theme().is_dark()))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.close_palette();
+                            cx.notify();
+                        })),
+                )
+                // The command palette owns focus and the keyboard while open.
+                .child(self.render_palette(window, cx))
+            })
+    }
+}
+
+/// Register every global shortcut on the application.
+///
+/// These are *app-level* action listeners ([`App::on_action`]), not handlers on
+/// the view's own element. GPUI dispatches an action along the path from the
+/// window root down to the focused node and then bubbles back up, so an element
+/// listener only runs when focus happens to be inside that element — which is
+/// why the shortcuts used to work only while the code editor had focus, and did
+/// nothing at all with nothing focused. App-level listeners run after that walk
+/// regardless of where focus is.
+///
+/// Registered once, when the window is created.
+fn bind_global_actions(cx: &mut App, view: &Entity<LeetrView>) {
+    fn listener<A: gpui_kit::Action + 'static>(
+        cx: &mut App,
+        view: &Entity<LeetrView>,
+        handler: impl Fn(&mut LeetrView, &mut App) + 'static,
+    ) {
+        let view = view.clone();
+        cx.on_action(move |_: &A, cx: &mut App| {
+            view.update(cx, |this, cx| handler(this, cx));
+        });
+    }
+
+    listener::<ToggleTheme>(cx, view, |this, cx| {
+        this.toggle_theme(cx);
+    });
+    // These need a window to move focus, so they are deferred to the next paint.
+    listener::<ActionPalette>(cx, view, |this, _| {
+        this.pending_palette = Some(PaletteKind::Actions);
+    });
+    listener::<ProblemPalette>(cx, view, |this, _| {
+        this.pending_palette = Some(PaletteKind::Problems);
+    });
+    listener::<CloseOverlay>(cx, view, |this, _| this.close_palette());
+    listener::<Quit>(cx, view, |_, cx| cx.quit());
+    listener::<OpenInNvim>(cx, view, |this, _| this.open_in_nvim());
+    listener::<RunTests>(cx, view, |this, _| this.start_judge(false));
+    listener::<SubmitSolution>(cx, view, |this, _| this.start_judge(true));
+    listener::<ToggleSidebar>(cx, view, |this, _| {
+        this.sidebar_collapsed = !this.sidebar_collapsed;
+    });
+}
+
+/// Start the GPUI application.
+pub fn run() -> anyhow::Result<()> {
+    let bootstrap = Bootstrap::load();
+    let theme = bootstrap.config.theme;
+    // Every icon GPUI Kit draws resolves through an `AssetSource`, so one has
+    // to be registered or icons render as nothing. `AllAssets` is the complete
+    // Lucide catalog: the curated `Assets` bundle covers what the components
+    // use internally but omits most of the icons the sidebar rows ask for, and
+    // a missing icon fails silently.
+    let mut application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    // Statement diagrams are remote files; GPUI fetches them through the app's
+    // `HttpClient`. Its built-in default returns an error, so Leetr supplies a
+    // blocking one (see `crate::img`).
+    if let Some(client) = crate::img::image_client() {
+        application = application.with_http_client(client);
+    }
+    application.run(move |cx: &mut App| {
+        // This must be called before using any GPUI Component features.
+        gpui_kit::init(cx);
+        // Draw the interface in Iosevka Nerd Font when it is installed; the
+        // bundled fallbacks render otherwise.
+        crate::fonts::install(cx);
+        KitTheme::change(theme.mode(), None, cx);
+
+        cx.bind_keys([
+            KeyBinding::new("ctrl-k", ActionPalette, None),
+            KeyBinding::new("ctrl-p", ProblemPalette, None),
+            KeyBinding::new("ctrl-o", OpenInNvim, None),
+            KeyBinding::new("ctrl-'", RunTests, None),
+            KeyBinding::new("ctrl-enter", SubmitSolution, None),
+            KeyBinding::new("ctrl-b", ToggleSidebar, None),
+            KeyBinding::new("escape", CloseOverlay, None),
+        ]);
+
+        let options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("Leetr".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opened = gpui_kit::open_window(options, cx, |window, cx| {
+            let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search problems…"));
+            let actions_cmd = cx.new(|cx| CommandState::new(window, cx));
+            let problems_cmd = cx.new(|cx| CommandState::new(window, cx));
+            let lang = editor_language(&bootstrap.config.default_language);
+            let code = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .language(lang)
+                    .default_value("")
+            });
+            cx.new(|cx| LeetrView::new(bootstrap, search, actions_cmd, problems_cmd, code, cx))
+        });
+        match opened {
+            Ok((_, view)) => bind_global_actions(cx, &view),
+            Err(err) => eprintln!("failed to open window: {err}"),
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::palette;
-    use egui::{Event, Key, Modifiers, RawInput};
 
-    /// Build a one-shot `RawInput` whose *live* modifier state is `live` while
-    /// the key event itself carries `event_modifiers`.
-    fn raw_input(key: Key, event_modifiers: Modifiers, live: Modifiers) -> RawInput {
-        RawInput {
-            events: vec![
-                Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: event_modifiers,
-                },
-                // The modifier is released before the frame runs — exactly what
-                // a fast (synthetic or human) key sequence looks like.
-                Event::ModifiersChanged(live),
-            ],
-            ..Default::default()
+    /// The languages the editor claims to highlight must really have a grammar
+    /// compiled in.
+    ///
+    /// This is the regression test for a real bug: the editor shipped with no
+    /// syntax highlighting at all because no `tree-sitter-*` feature was
+    /// enabled, and nothing failed — the language simply fell back to plain
+    /// text. Asserting the grammar exists makes that failure visible.
+    #[test]
+    fn every_highlighted_language_has_a_compiled_in_grammar() {
+        use gpui_kit::component::highlighter::LanguageRegistry;
+
+        // Only these two grammars are compiled in (see Cargo.toml).
+        const HIGHLIGHTED: &[&str] = &["python", "cpp"];
+        // Slugs that must map onto them, including C, which rides the C++
+        // grammar.
+        const ALIASES: &[&str] = &[
+            "python",
+            "python3",
+            "py",
+            "pythondata",
+            "pandas",
+            "cpp",
+            "c++",
+            "c",
+        ];
+
+        let registry = LanguageRegistry::singleton();
+        for slug in ALIASES {
+            let name = editor_language(slug);
+            assert!(
+                HIGHLIGHTED.contains(&name),
+                "{slug} maps to {name:?}, which is not a compiled-in grammar"
+            );
+        }
+        for name in HIGHLIGHTED {
+            let config = registry
+                .language(name)
+                .unwrap_or_else(|| panic!("{name:?} is not a language the registry knows"));
+            assert!(
+                config.has_grammar(),
+                "{name:?} has no tree-sitter grammar — the `tree-sitter-{name}` feature is \
+                 probably missing from Cargo.toml"
+            );
         }
     }
 
-    /// Regression test for a real bug.
-    ///
-    /// `Ctrl+K` did nothing because the check used `InputState::modifiers`
-    /// (the *live* key state), which had already been reset to `NONE` by the
-    /// time the frame ran. `consume_key` matches the event's own modifiers.
     #[test]
-    fn consume_key_matches_the_event_modifiers_not_the_live_key_state() {
-        let ctx = egui::Context::default();
+    fn languages_without_a_grammar_render_as_plain_text() {
+        use gpui_kit::component::highlighter::LanguageRegistry;
 
-        let mut naive = false;
-        let mut robust = false;
-        let mut output = ctx.run_ui(
-            raw_input(Key::K, Modifiers::COMMAND, Modifiers::NONE),
-            |_ui| {
-                naive = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::K));
-                robust = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K));
-            },
-        );
-        output.textures_delta.clear();
+        // Languages LeetCode offers that this build deliberately does not
+        // highlight.
+        for slug in [
+            "rust",
+            "java",
+            "golang",
+            "javascript",
+            "typescript",
+            "csharp",
+            "ruby",
+            "swift",
+            "kotlin",
+            "scala",
+            "php",
+            "elixir",
+            "bash",
+            "mysql",
+        ] {
+            assert_eq!(
+                editor_language(slug),
+                "text",
+                "{slug} has no grammar and must fall back to plain text"
+            );
+        }
+        // Unknown slugs too.
+        assert_eq!(editor_language("dart"), "text");
+        assert_eq!(editor_language("racket"), "text");
 
+        // The fallback itself has to be a language the registry knows, or the
+        // editor would treat the name as garbage rather than as plain text.
         assert!(
-            !naive,
-            "the live modifier state is stale here — checking it is the bug"
+            LanguageRegistry::singleton().language("text").is_some(),
+            "the plain-text fallback must be a registered language"
         );
-        assert!(
-            robust,
-            "consume_key must match on the event's own modifiers"
-        );
-    }
-
-    #[test]
-    fn plain_keys_do_not_trigger_command_shortcuts() {
-        let ctx = egui::Context::default();
-        let mut triggered = false;
-        let mut output = ctx.run_ui(raw_input(Key::K, Modifiers::NONE, Modifiers::NONE), |_ui| {
-            triggered = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K));
-        });
-        output.textures_delta.clear();
-        assert!(!triggered, "K without a modifier must not open the palette");
-    }
-
-    #[test]
-    fn a_shortcut_fires_only_once_per_press() {
-        let ctx = egui::Context::default();
-        let mut first = false;
-        let mut second = false;
-        let mut output = ctx.run_ui(
-            raw_input(Key::P, Modifiers::COMMAND, Modifiers::NONE),
-            |_ui| {
-                first = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P));
-                second = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P));
-            },
-        );
-        output.textures_delta.clear();
-
-        assert!(first);
-        assert!(!second, "a consumed shortcut must not fire twice");
-    }
-
-    #[test]
-    fn choosing_a_row_index_dismisses_the_palette() {
-        let mut state = PaletteState::default();
-        state.open();
-
-        let outcome = PaletteOutcome {
-            chosen: Some(3),
-            ..Default::default()
-        };
-        assert_eq!(resolve_palette_choice(&mut state, &outcome), Some(3));
-        assert!(!state.is_open(), "choosing must close the palette");
-    }
-
-    #[test]
-    fn closing_without_choosing_leaves_nothing_selected() {
-        let mut state = PaletteState::default();
-        state.open();
-
-        let outcome = PaletteOutcome {
-            closed: true,
-            ..Default::default()
-        };
-        assert_eq!(resolve_palette_choice(&mut state, &outcome), None);
-        assert!(!state.is_open());
-    }
-
-    #[test]
-    fn an_open_palette_with_no_action_stays_open() {
-        let mut state = PaletteState::default();
-        state.open();
-
-        assert_eq!(
-            resolve_palette_choice(&mut state, &PaletteOutcome::default()),
-            None
-        );
-        assert!(state.is_open(), "typing must not close the palette");
     }
 
     #[test]
@@ -1654,20 +2693,6 @@ mod tests {
         // here would again tell the user to add credentials they have.
         assert_eq!(auth_badge_for(None, true, 0), AuthBadge::Checking);
         assert_eq!(auth_badge_for(None, false, 0), AuthBadge::BrowseOnly);
-    }
-
-    #[test]
-    fn tab_only_switches_panes_when_nothing_is_focused() {
-        // Focused text field: Tab belongs to the widget, not to us.
-        assert!(!tab_switches_panes(Tab::Statement, false));
-        assert!(!tab_switches_panes(Tab::Code, false));
-
-        // Nothing focused: the shortcut is ours on the statement pane only.
-        assert!(tab_switches_panes(Tab::Statement, true));
-        assert!(
-            !tab_switches_panes(Tab::Code, true),
-            "Tab must not toggle back out of the code pane"
-        );
     }
 
     #[test]

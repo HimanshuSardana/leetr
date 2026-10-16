@@ -1,4 +1,4 @@
-//! Leetr — a lightweight `egui` LeetCode client with first-class nvim
+//! Leetr — a lightweight GPUI LeetCode client with first-class nvim
 //! interoperability.
 //!
 //! The crate is split into a library and a thin binary so the API client,
@@ -13,6 +13,7 @@ pub mod desktop;
 pub mod editor;
 pub mod fonts;
 pub mod glyphs;
+pub mod img;
 pub mod interop;
 pub mod leetcode;
 pub mod model;
