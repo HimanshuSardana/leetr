@@ -1155,7 +1155,8 @@ impl LeetrView {
     ) {
         match kind {
             PaletteKind::Actions => {
-                let groups = self.action_groups();
+                let query = self.actions_cmd.read(cx).query(cx).to_string();
+                let groups = self.action_groups(&query);
                 let action = groups
                     .get(path.section)
                     .and_then(|(_, rows)| rows.get(path.row))
@@ -1248,15 +1249,44 @@ impl LeetrView {
     }
 
     /// Action rows grouped by section, in catalog order.
-    fn action_groups(&self) -> Vec<(String, Vec<(Action, String)>)> {
-        let mut groups: Vec<(String, Vec<(Action, String)>)> = Vec::new();
-        for (action, hint, section, _) in self.action_catalog() {
-            match groups.last_mut() {
-                Some((name, rows)) if name == section => rows.push((action, hint)),
-                _ => groups.push((section.to_string(), vec![(action, hint)])),
+    /// Action rows matching `query`, grouped by section for browsing and flat
+    /// when ranked.
+    ///
+    /// The palette runs with the component's own filtering off (`.filterable(false)`)
+    /// so that ranking stays fuzzy — which means the rows have to be filtered
+    /// here, on every render, or typing in the field would do nothing.
+    fn action_groups(&self, query: &str) -> Vec<(String, Vec<(Action, String)>)> {
+        let catalog = self.action_catalog();
+        let entries: Vec<PaletteEntry> = catalog
+            .iter()
+            .map(|(action, hint, section, _)| {
+                PaletteEntry::new(action.search_label())
+                    .with_hint(hint.clone())
+                    .with_section(*section)
+            })
+            .collect();
+        let matches = palette::visible_matches(query, &entries, None);
+
+        if query.trim().is_empty() {
+            let mut groups: Vec<(String, Vec<(Action, String)>)> = Vec::new();
+            for index in matches {
+                let (action, hint, section, _) = &catalog[index];
+                match groups.last_mut() {
+                    Some((name, rows)) if name == *section => rows.push((*action, hint.clone())),
+                    _ => groups.push((section.to_string(), vec![(*action, hint.clone())])),
+                }
             }
+            groups
+        } else {
+            let rows = matches
+                .into_iter()
+                .map(|index| {
+                    let (action, hint, _, _) = &catalog[index];
+                    (*action, hint.clone())
+                })
+                .collect();
+            vec![("Commands".to_string(), rows)]
         }
-        groups
     }
 
     /// Problem rows matching `query`/`chip`, grouped by status for browsing
@@ -2021,6 +2051,8 @@ impl LeetrView {
             PaletteKind::Actions => {
                 let cancel_view = view.clone();
                 let confirm_view = view.clone();
+                let query = self.actions_cmd.read(cx).query(cx).to_string();
+                let groups = self.action_groups(&query);
                 let mut command = Command::new(&self.actions_cmd)
                     .filterable(false)
                     .placeholder("Type a command…")
@@ -2037,7 +2069,7 @@ impl LeetrView {
                     });
                     window.refresh();
                 });
-                for (section, rows) in self.action_groups() {
+                for (section, rows) in groups {
                     let mut group = CommandGroup::new().label(section);
                     for (action, _) in rows {
                         group = group.item(CommandItem::new().label(action.search_label()));
