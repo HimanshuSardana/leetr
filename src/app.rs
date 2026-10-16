@@ -32,9 +32,9 @@ use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::Focusable;
 use gpui_kit::{
-    div, img, px, rgb, AnyElement, App, ClickEvent, Context, Entity, FontWeight, IntoElement,
-    KeyBinding, ObjectFit, Render, SharedString, Subscription, TitlebarOptions, Window,
-    WindowOptions,
+    div, img, px, rgb, AnyElement, App, ClickEvent, Context, Entity, Font, FontStyle, FontWeight,
+    Hsla, IntoElement, KeyBinding, ObjectFit, Render, SharedString, StyledText, Subscription,
+    TextRun, TitlebarOptions, Window, WindowOptions,
 };
 
 use crate::bg::Bg;
@@ -1828,7 +1828,7 @@ impl LeetrView {
 
         let tab = self.tab;
         let pane = match tab {
-            Tab::Statement => self.render_statement(&detail),
+            Tab::Statement => self.render_statement(&detail, cx),
             Tab::Code => self.render_code(cx),
         };
 
@@ -1845,7 +1845,19 @@ impl LeetrView {
             .into_any_element()
     }
 
-    fn render_statement(&self, detail: &QuestionDetail) -> AnyElement {
+    fn render_statement(&self, detail: &QuestionDetail, cx: &Context<Self>) -> AnyElement {
+        // Code blocks in a statement are drawn by hand, so they have to take
+        // their colours from the theme. They used to hard-code a dark surface
+        // and inherited the foreground, which made them dark-on-dark in light
+        // mode.
+        let style = StatementStyle {
+            fg: cx.theme().foreground,
+            code_fg: rgb(theme::ACCENT_HEX).into(),
+            // `muted` is a surface, so it reads correctly in both themes.
+            code_bg: cx.theme().muted,
+            ui_family: cx.theme().font_family.clone(),
+            mono_family: cx.theme().mono_font_family.clone(),
+        };
         let header = div()
             .flex()
             .flex_col()
@@ -1903,7 +1915,7 @@ impl LeetrView {
             );
         } else {
             for (index, block) in self.detail_blocks.iter().enumerate() {
-                body = body.child(render_block(block, index));
+                body = body.child(render_block(block, index, &style));
             }
             if !detail.hints.is_empty() {
                 body = body.child(
@@ -2158,27 +2170,39 @@ impl LeetrView {
     }
 }
 
-fn render_block(block: &Block, index: usize) -> AnyElement {
+/// Everything the statement renderer needs from the active theme and font
+/// configuration, resolved once per frame.
+#[derive(Clone)]
+struct StatementStyle {
+    fg: Hsla,
+    code_fg: Hsla,
+    code_bg: Hsla,
+    ui_family: SharedString,
+    mono_family: SharedString,
+}
+
+fn render_block(block: &Block, index: usize, style: &StatementStyle) -> AnyElement {
     match block {
-        Block::Paragraph(spans) => render_spans(spans, false),
+        Block::Paragraph(spans) => render_spans(spans, style),
         Block::Heading(spans) => div()
             .text_lg()
             .font_weight(FontWeight::BOLD)
-            .child(render_spans(spans, false))
+            .child(render_spans(spans, style))
             .into_any_element(),
         Block::ListItem(spans) => div()
             .flex()
             .flex_row()
             .gap_2()
             .child(div().text_sm().child("•"))
-            .child(render_spans(spans, false))
+            .child(render_spans(spans, style))
             .into_any_element(),
         Block::Code(code) => div()
             .w_full()
             .rounded_md()
-            .bg(rgb(0x121417))
+            .bg(style.code_bg)
+            .text_color(style.fg)
             .p_2()
-            .child(div().text_xs().child(code.trim_end().to_string()))
+            .child(div().text_xs().child(clean_code(code).to_string()))
             .into_any_element(),
         Block::Image { alt, url } => render_image(alt, url, index),
         Block::Rule => div()
@@ -2275,29 +2299,74 @@ fn render_image(alt: &str, url: &str, index: usize) -> AnyElement {
         .into_any_element()
 }
 
-fn render_spans(spans: &[crate::leetcode::html::Span], _heading: bool) -> AnyElement {
+/// Strip the blank line LeetCode's HTML puts immediately after `<pre>`.
+///
+/// Only newlines are removed, never indentation: leading spaces are code.
+fn clean_code(code: &str) -> &str {
+    code.trim_start_matches(['\n', '\r']).trim_end()
+}
+
+/// One paragraph's inline run, as a single text flow.
+///
+/// This used to be a flex row of one element per span, which cannot share a
+/// baseline — inline code sat at a different height from the words around it,
+/// and lines broke between spans rather than between words. Runs on one
+/// `StyledText` give normal inline layout.
+fn render_spans(spans: &[crate::leetcode::html::Span], style: &StatementStyle) -> AnyElement {
+    let mut text = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+
+    for span in spans {
+        if span.text.is_empty() {
+            continue;
+        }
+        let bold = matches!(span.style, SpanStyle::Bold | SpanStyle::BoldItalic);
+        let italic = matches!(span.style, SpanStyle::Italic | SpanStyle::BoldItalic);
+        let code = matches!(span.style, SpanStyle::Code);
+
+        // A `TextRun` carries family, weight and colour but no size, so inline
+        // code is the same size as the prose and is told apart by its family
+        // and background instead.
+        let (family, color, background) = if code {
+            (
+                style.mono_family.clone(),
+                style.code_fg,
+                // Tinting inline code keeps it distinct without turning a
+                // sentence into a stripe.
+                Some(style.code_bg),
+            )
+        } else {
+            (style.ui_family.clone(), style.fg, None)
+        };
+
+        text.push_str(&span.text);
+        runs.push(TextRun {
+            len: span.text.len(),
+            font: Font {
+                family,
+                features: Default::default(),
+                fallbacks: None,
+                weight: if bold {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                },
+                style: if italic {
+                    FontStyle::Italic
+                } else {
+                    FontStyle::Normal
+                },
+            },
+            color,
+            background_color: background,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+
     div()
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .children(
-            spans
-                .iter()
-                .map(|span| {
-                    let mut text = div().text_sm().child(span.text.clone());
-                    match span.style {
-                        SpanStyle::Bold | SpanStyle::BoldItalic => {
-                            text = text.font_weight(FontWeight::BOLD);
-                        }
-                        SpanStyle::Code => {
-                            text = text.text_color(rgb(theme::ACCENT_HEX)).text_xs();
-                        }
-                        SpanStyle::Normal | SpanStyle::Italic => {}
-                    }
-                    text
-                })
-                .collect::<Vec<_>>(),
-        )
+        .text_sm()
+        .child(StyledText::new(text).with_runs(runs))
         .into_any_element()
 }
 
