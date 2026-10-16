@@ -32,9 +32,9 @@ use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::Focusable;
 use gpui_kit::{
-    div, img, px, rgb, AnyElement, App, ClickEvent, Context, Entity, Font, FontStyle, FontWeight,
-    Hsla, IntoElement, KeyBinding, ObjectFit, Render, SharedString, StyledText, Subscription,
-    TextRun, TitlebarOptions, Window, WindowOptions,
+    div, img, px, rgb, AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Font, FontStyle,
+    FontWeight, Hsla, IntoElement, KeyBinding, ObjectFit, Render, SharedString, StyledText,
+    Subscription, TextRun, TitlebarOptions, Window, WindowOptions,
 };
 
 use crate::bg::Bg;
@@ -68,6 +68,10 @@ gpui_kit::actions!(
         ToggleSidebar,
         ShowStatementTab,
         ShowCodeTab,
+        FocusSidebar,
+        SidebarNext,
+        SidebarPrev,
+        SidebarOpen,
     ]
 );
 
@@ -103,6 +107,12 @@ pub enum Tab {
     Statement,
     Code,
 }
+
+/// Key context set by the sidebar's focus target.
+///
+/// Bindings for j / k / Enter match against it, so they only apply while the
+/// sidebar itself has focus.
+const SIDEBAR_CONTEXT: &str = "LeetrSidebar && !Input";
 
 /// Which command palette is open. [`Command`] owns the query, the filter and
 /// the highlight; the view supplies ranked rows and applies choices.
@@ -406,6 +416,13 @@ pub struct LeetrView {
     quit_requested: bool,
     /// The problem sidebar is hidden.
     sidebar_collapsed: bool,
+    /// Focus target for keyboard browsing of the problem list.
+    sidebar_focus: FocusHandle,
+    /// Highlighted row within the sidebar's visible rows, moved by j / k.
+    sidebar_cursor: Option<usize>,
+    /// Alt+S was pressed; focusing needs a window, so it happens on the next
+    /// paint.
+    pending_sidebar_focus: bool,
 }
 
 impl LeetrView {
@@ -417,6 +434,8 @@ impl LeetrView {
         code_input: Entity<EditorState>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let sidebar_focus = cx.focus_handle();
+
         // Keep the search field and the filter model in sync.
         let search_sub = cx.subscribe(
             &search_input,
@@ -506,6 +525,9 @@ impl LeetrView {
             code_input_needs_sync: None,
             quit_requested: false,
             sidebar_collapsed: false,
+            sidebar_focus,
+            sidebar_cursor: None,
+            pending_sidebar_focus: false,
         };
 
         view.refresh_session();
@@ -1148,6 +1170,49 @@ impl LeetrView {
     }
 
     /// One confirmed command-palette row.
+    /// Problems the sidebar is currently listing, in display order.
+    fn visible_problem_indices(&self) -> Vec<usize> {
+        let mut rows = self.list_state.matching(&self.problems);
+        rows.truncate(rows.len().min(self.row_cap));
+        rows
+    }
+
+    /// Row of the open problem, so Alt+S starts where the reader is.
+    fn cursor_row_for_current_problem(&self) -> usize {
+        let rows = self.visible_problem_indices();
+        self.selected
+            .as_deref()
+            .and_then(|slug| {
+                rows.iter()
+                    .position(|&index| self.problems[index].slug == slug)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Move the sidebar cursor, clamped at both ends rather than wrapping.
+    fn move_sidebar_cursor(&mut self, forward: bool) {
+        let count = self.visible_problem_indices().len();
+        if count == 0 {
+            self.sidebar_cursor = None;
+            return;
+        }
+        let current = self.sidebar_cursor.unwrap_or(0).min(count - 1);
+        self.sidebar_cursor = Some(if forward {
+            (current + 1).min(count - 1)
+        } else {
+            current.saturating_sub(1)
+        });
+    }
+
+    /// Open the problem under the sidebar cursor.
+    fn open_sidebar_cursor(&mut self) {
+        let rows = self.visible_problem_indices();
+        if let Some(&index) = self.sidebar_cursor.and_then(|cursor| rows.get(cursor)) {
+            let slug = self.problems[index].slug.clone();
+            self.open_problem(slug);
+        }
+    }
+
     /// Search LeetCode for whatever is typed in the problem palette.
     ///
     /// The same thing the palette's fallback row does, reachable without
@@ -1468,7 +1533,7 @@ impl LeetrView {
             .text_color(rgb(theme::difficulty_hex(difficulty)))
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&mut self, cx: &mut Context<Self>, focused: bool) -> AnyElement {
         let matching = self.list_state.matching(&self.problems);
         let shown = matching.len().min(self.row_cap);
         let view = cx.entity();
@@ -1604,10 +1669,17 @@ impl LeetrView {
 
         // ---- "Problems" group ----
         let mut problem_items = Vec::new();
-        for &index in matching.iter().take(shown) {
+        let cursor = self.sidebar_cursor.filter(|_| focused);
+        for (position, &index) in matching.iter().take(shown).enumerate() {
             let problem = &self.problems[index];
             let slug = problem.slug.clone();
-            let active = self.selected.as_deref() == Some(slug.as_str());
+            // With the sidebar focused the highlight follows the cursor;
+            // otherwise it marks the problem that is open.
+            let active = if cursor.is_some() {
+                cursor == Some(position)
+            } else {
+                self.selected.as_deref() == Some(slug.as_str())
+            };
             let label = format!("{}. {}", problem.id, problem.title);
             let icon = Self::status_icon(problem.status, problem.difficulty);
             let item_view = view.clone();
@@ -1694,7 +1766,12 @@ impl LeetrView {
         }
 
         // ---- footer: counts ----
-        let footer = if self.list_loading {
+        let footer = if focused {
+            div()
+                .text_xs()
+                .text_color(rgb(MUTED_DARK))
+                .child("j / k move · Enter opens")
+        } else if self.list_loading {
             div()
                 .flex()
                 .flex_row()
@@ -1747,7 +1824,16 @@ impl LeetrView {
             sidebar = sidebar.child(SidebarGroup::new("Current problem").children(current_items));
         }
         sidebar = sidebar.child(SidebarGroup::new("App").children(app_items));
-        sidebar.footer(footer).into_any_element()
+        // The wrapper is the focus target: it carries the key context the j / k
+        // / Enter bindings match against, and it is what Alt+S focuses.
+        div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .track_focus(&self.sidebar_focus)
+            .key_context("LeetrSidebar")
+            .child(sidebar.footer(footer))
+            .into_any_element()
     }
 
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -2448,6 +2534,20 @@ impl Render for LeetrView {
             });
         }
 
+        // Alt+S asked to drive the list from the keyboard; focusing needs the
+        // window, so it happens here.
+        if self.pending_sidebar_focus {
+            self.pending_sidebar_focus = false;
+            if self.sidebar_cursor.is_none() {
+                self.sidebar_cursor = Some(self.cursor_row_for_current_problem());
+            }
+            window.focus(&self.sidebar_focus, cx);
+        }
+        // Whether the sidebar holds focus is read from the window rather than
+        // mirrored in state, so clicking into the editor ends keyboard
+        // browsing with no bookkeeping.
+        let sidebar_focused = self.sidebar_focus.is_focused(window);
+
         // A global shortcut asked for a palette; focusing its field needs the
         // window, so it is applied here.
         if let Some(kind) = self.pending_palette.take() {
@@ -2468,9 +2568,10 @@ impl Render for LeetrView {
                     .flex()
                     .flex_row()
                     .flex_1()
-                    .when(!self.sidebar_collapsed, |row| {
-                        row.child(self.render_sidebar(cx))
-                    })
+                    // Always rendered: the component animates its own width
+                    // between the expanded panel and the icon rail, which only
+                    // works if it stays mounted while collapsed.
+                    .child(self.render_sidebar(cx, sidebar_focused))
                     .child(
                         div()
                             .flex()
@@ -2555,6 +2656,12 @@ fn bind_global_actions(cx: &mut App, view: &Entity<LeetrView>) {
     listener::<ToggleSidebar>(cx, view, |this, _| {
         this.sidebar_collapsed = !this.sidebar_collapsed;
     });
+    // Focusing needs the window, which an action listener does not get, so the
+    // request is applied on the next paint.
+    listener::<FocusSidebar>(cx, view, |this, _| this.pending_sidebar_focus = true);
+    listener::<SidebarNext>(cx, view, |this, _| this.move_sidebar_cursor(true));
+    listener::<SidebarPrev>(cx, view, |this, _| this.move_sidebar_cursor(false));
+    listener::<SidebarOpen>(cx, view, |this, _| this.open_sidebar_cursor());
     listener::<ShowStatementTab>(cx, view, |this, _| this.tab = Tab::Statement);
     listener::<ShowCodeTab>(cx, view, |this, _| this.tab = Tab::Code);
 }
@@ -2600,6 +2707,13 @@ pub fn run() -> anyhow::Result<()> {
             // stack, which is the state with nothing focused.
             KeyBinding::new("alt-1", ShowStatementTab, None),
             KeyBinding::new("alt-2", ShowCodeTab, None),
+            KeyBinding::new("alt-s", FocusSidebar, None),
+            // Only while the sidebar itself holds focus, and never while one of
+            // its fields does (`&& !Input`), so j and k stay ordinary
+            // characters in the filter box and in the editor.
+            KeyBinding::new("j", SidebarNext, Some(SIDEBAR_CONTEXT)),
+            KeyBinding::new("k", SidebarPrev, Some(SIDEBAR_CONTEXT)),
+            KeyBinding::new("enter", SidebarOpen, Some(SIDEBAR_CONTEXT)),
         ]);
 
         let options = WindowOptions {
